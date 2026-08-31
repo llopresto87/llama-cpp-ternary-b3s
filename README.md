@@ -4,13 +4,15 @@
 > It adds one thing on top of upstream: the **`Q2_B3` ("B3S") ternary
 > quantization type** — 128-weight blocks of `{-1, 0, +1}` values with a single
 > f16 scale, base-3 packed at **1.75 bits/weight**, with CPU, CUDA/HIP
-> (RDNA3/gfx1100), and Vulkan kernels. Upstream ships no GPU kernels for its
-> ternary types; this fork does, for `Q2_B3`.
+> (RDNA3/gfx1100), Vulkan, and Metal kernels. Upstream ships no GPU kernels for
+> its ternary types; this fork does, for `Q2_B3`. **The GPU kernels compile but
+> are not yet hardware-verified — run inference on CPU for trustworthy output.**
 >
 > **Why the fork exists:** to enable and serve B3S-quantized models (e.g.
 > Ternary-Bonsai) on consumer AMD GPUs, kept as a thin, rebase-friendly delta
 > over upstream master (base `4e97ac86e`) rather than a divergent tree. The
-> model repacker is maintained separately in its own repository.
+> model repacker is maintained separately:
+> **https://github.com/llopresto87/ternary-q2_0-repacker**
 >
 > **B3S documentation:** see **[`README_B3S.md`](README_B3S.md)** for the format
 > spec, the bits-per-weight math, packing layout, advantages, and honest

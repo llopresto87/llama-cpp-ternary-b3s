@@ -5,7 +5,7 @@ quantization format designed for weights that are already ternary-native
 (BitNet-b1.58-style / "Ternary Bonsai" models). The format is an alternative to
 the upstream ternary types `TQ1_0`/`TQ2_0`: it packs 128 weights per block in
 base-3 at 1.75 bits per weight, and — unlike the upstream TQ types — ships GPU
-kernels (CUDA/HIP and Vulkan) in this tree.
+kernels for CUDA/HIP, Vulkan, and Metal in this tree.
 
 All identifiers, constants, and byte counts below were read from this checkout.
 
@@ -123,6 +123,10 @@ q2_b3 block maps to four q8_0 blocks, and each 32-trit chunk contributes
     GEMV with per-type wave tuning (`mmvq.cu:1096-1403`).
   - Vulkan: `dequant_q2_b3.comp` plus Q2_B3 mul-mat / mul-mat-vec shader
     wiring (`ggml/src/ggml-vulkan/ggml-vulkan.cpp`).
+  - Metal (Apple): `dequantize_q2_b3` plus `mul_mm` / `mul_mv` / `cpy` /
+    `get_rows` kernels and device dispatch
+    (`ggml/src/ggml-metal/kernels/{dequantize.h,mul_mm.metal,mul_mv.metal,quantize.metal}`,
+    `ggml-metal-device.cpp`/`.m`).
 
   By contrast, upstream ternary `TQ1_0`/`TQ2_0` have **no CUDA/HIP code**: a
   grep of `ggml/src/ggml-cuda` in this tree for `tq1_0|tq2_0` returns zero
@@ -136,6 +140,11 @@ q2_b3 block maps to four q8_0 blocks, and each 32-trit chunk contributes
 
 ## 4. Limitations / honest caveats
 
+- **GPU kernels are UNVERIFIED on hardware.** The CUDA/HIP, Metal, and Vulkan
+  Q2_B3 kernels compile, but have **not** been confirmed to produce correct
+  output on real GPUs in this tree. Only the CPU reference codec is known-good.
+  Treat all GPU paths as experimental: for trustworthy output right now, run on
+  CPU. Correctness reports for any GPU backend are exactly the feedback wanted.
 - **Only for ternary-native weights.** Q2_B3 is a ternary codec, not a general
   2-bit quantizer for arbitrary FP models. Applying it to ordinary FP16
   weights collapses each weight to three levels; quality on non-ternary models
@@ -172,3 +181,15 @@ On the Python side the GGUF registration lives in `gguf-py/gguf/constants.py`:
 
 GGUF files with the Q2_B3 ftype/tensors are therefore recognized by the
 standard `gguf-py` tooling in this repo.
+
+### Producing a Q2_B3 model (repacker)
+
+The tool that converts an already-ternary checkpoint into a `Q2_B3` GGUF is
+maintained in its own repository:
+
+- **Repacker:** https://github.com/llopresto87/ternary-q2_0-repacker
+
+Point it at a ternary-native checkpoint (e.g. a Ternary-Bonsai model) to emit a
+`Q2_B3` GGUF, then load that GGUF with the `llama-cli` / `llama-server` built
+from this fork. (Reminder: for now, run inference on the CPU backend — the GPU
+kernels are not yet hardware-verified.)
