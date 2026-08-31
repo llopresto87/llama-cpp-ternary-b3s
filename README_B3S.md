@@ -140,11 +140,13 @@ q2_b3 block maps to four q8_0 blocks, and each 32-trit chunk contributes
 
 ## 4. Limitations / honest caveats
 
-- **GPU kernels are UNVERIFIED on hardware.** The CUDA/HIP, Metal, and Vulkan
-  Q2_B3 kernels compile, but have **not** been confirmed to produce correct
-  output on real GPUs in this tree. Only the CPU reference codec is known-good.
-  Treat all GPU paths as experimental: for trustworthy output right now, run on
-  CPU. Correctness reports for any GPU backend are exactly the feedback wanted.
+- **Backend verification status (varies by backend).** The **AMD ROCm/HIP**
+  path on RDNA3 (gfx1100) is the primary target and has had extensive testing;
+  it is the backend the kernels were tuned on. The **CPU** reference codec is
+  correct by construction. The **NVIDIA CUDA** and **Apple Metal** paths are
+  compiled but not yet verified on that hardware (no test devices), so treat
+  them as experimental until confirmed. Correctness reports for CUDA/Metal are
+  exactly the feedback wanted.
 - **Only for ternary-native weights.** Q2_B3 is a ternary codec, not a general
   2-bit quantizer for arbitrary FP models. Applying it to ordinary FP16
   weights collapses each weight to three levels; quality on non-ternary models
@@ -191,5 +193,5 @@ maintained in its own repository:
 
 Point it at a ternary-native checkpoint (e.g. a Ternary-Bonsai model) to emit a
 `Q2_B3` GGUF, then load that GGUF with the `llama-cli` / `llama-server` built
-from this fork. (Reminder: for now, run inference on the CPU backend — the GPU
-kernels are not yet hardware-verified.)
+from this fork. The AMD ROCm/HIP (RDNA3) and CPU backends are the tested paths;
+NVIDIA CUDA and Apple Metal are compiled but not yet hardware-verified.

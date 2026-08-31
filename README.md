@@ -5,8 +5,10 @@
 > quantization type** — 128-weight blocks of `{-1, 0, +1}` values with a single
 > f16 scale, base-3 packed at **1.75 bits/weight**, with CPU, CUDA/HIP
 > (RDNA3/gfx1100), Vulkan, and Metal kernels. Upstream ships no GPU kernels for
-> its ternary types; this fork does, for `Q2_B3`. **The GPU kernels compile but
-> are not yet hardware-verified — run inference on CPU for trustworthy output.**
+> its ternary types; this fork does, for `Q2_B3`. **The AMD ROCm/HIP path
+> (RDNA3, gfx1100) is the primary target and has had extensive testing; the CPU
+> reference codec is correct by construction. The NVIDIA CUDA and Apple Metal
+> paths are compiled but not yet verified on that hardware.**
 >
 > **Why the fork exists:** to enable and serve B3S-quantized models (e.g.
 > Ternary-Bonsai) on consumer AMD GPUs, kept as a thin, rebase-friendly delta
