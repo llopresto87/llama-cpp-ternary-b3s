@@ -1,4 +1,23 @@
-# llama.cpp
+# llama.cpp — Ternary Bonsai B3S fork
+
+> **This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).**
+> It adds one thing on top of upstream: the **`Q2_B3` ("B3S") ternary
+> quantization type** — 128-weight blocks of `{-1, 0, +1}` values with a single
+> f16 scale, base-3 packed at **1.75 bits/weight**, with CPU, CUDA/HIP
+> (RDNA3/gfx1100), and Vulkan kernels. Upstream ships no GPU kernels for its
+> ternary types; this fork does, for `Q2_B3`.
+>
+> **Why the fork exists:** to enable and serve B3S-quantized models (e.g.
+> Ternary-Bonsai) on consumer AMD GPUs, kept as a thin, rebase-friendly delta
+> over upstream master (base `4e97ac86e`) rather than a divergent tree. The
+> model repacker is maintained separately in its own repository.
+>
+> **B3S documentation:** see **[`README_B3S.md`](README_B3S.md)** for the format
+> spec, the bits-per-weight math, packing layout, advantages, and honest
+> limitations. Everything below this notice is the standard upstream llama.cpp
+> README.
+
+---
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
