@@ -86,13 +86,17 @@ layout (constant_id = 10) const uint WARP = 32;
 #ifdef MUL_MAT_ID
 #define BK_STEP 1
 #else
-#ifndef BK_STEP
-#define BK_STEP 4
-#endif
+// Specialize the number of staged K32 blocks per pipeline. This controls the
+// barrier/residency trade without generating duplicate shader modules.
+layout (constant_id = 11) const uint BK_STEP = 4;
 #endif
 
 // Shared memory cache
+#if defined(DATA_A_Q2_0)
+shared block_a_shmem buf_a[BM * BK_STEP];
+#else
 shared block_a_cache buf_a[BM * BK_STEP];
+#endif
 shared block_b_cache buf_b[BN * BK_STEP];
 // Register cache
 block_a_cache cache_a[WMITER * TM];

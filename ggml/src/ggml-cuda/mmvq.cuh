@@ -11,6 +11,20 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// Independent ternary projections sharing one activation vector, issued as a single
+// dispatch over the concatenation of their rows. Small GEMVs cannot amortize their launch
+// ramp (attn_gate m=6144 runs at 372 GB/s where m=17408 reaches 750), and re-decomposing
+// them measured worse in both directions -- so the lever is a bigger dispatch, not a
+// different one.
+#define TQ_CUDA_MULTI_MAX 4
+
+bool ggml_cuda_should_fuse_mul_mat_vec_q_pair(const ggml_tensor * a, const ggml_tensor * b);
+
+// N-way generalisation of the pair fusion: up to TQ_CUDA_MULTI_MAX MUL_MAT nodes that share
+// one activation node are issued as one dispatch over the concatenation of their rows.
+void ggml_cuda_mul_mat_vec_q_multi(ggml_backend_cuda_context & ctx,
+    ggml_tensor ** nodes, int n_nodes);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

@@ -1,0 +1,33 @@
+#version 450
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_q2_b3 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    // 16 threads per 128-value block, 8 values per thread
+    const uint ib = gl_WorkGroupID.x * 16 + tid / 16;
+    if (ib >= p.nel / 128) {
+        return;
+    }
+
+    const uint iqs = (tid % 16) * 8;
+    const uint b_idx = ib * 128 + iqs;
+
+    const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+    const float d = float(data_a[ib].d0);
+
+    [[unroll]] for (uint t = 0; t < 8; ++t) {
+        const uint j = iqs + t;
+        // v2 chunk-aligned layout: chunk c bytes [6c..6c+5] + straggler 24+(c>>1)
+        const uint c = j >> 5, tt = j & 31u;
+        const uint byte_i = tt < 30u ? 6u*c + tt/5u : 24u + (c >> 1u);
+        const uint digit  = tt < 30u ? tt % 5u : 2u*(c & 1u) + (tt - 30u);
+        const uint q = (uint(data_a[ib].qs[byte_i]) / pw3[digit]) % 3u;
+        data_b[b_idx + t] = D_TYPE(d * float(int(q) - 1));
+    }
+}

@@ -70,7 +70,9 @@ uint32_t backend_backend_graph_compute(apir_encoder * enc, apir_decoder * dec, v
 #if APIR_BACKEND_CHECK_SUPPORTS_OP == 1
     for (int idx = 0; idx < cgraph->n_nodes; idx++) {
         ggml_tensor * op = ggml_graph_node(cgraph, idx);
-        if (dev->iface.supports_op(dev, op)) {
+        // public entry point, not dev->iface: see the fail-closed FLASH_ATTN_EXT
+        // src[5] guard in ggml_backend_dev_supports_op().
+        if (ggml_backend_dev_supports_op(dev, op)) {
             continue;
         }
         GGML_LOG_ERROR(GGML_VIRTGPU_BCK "%s: Graph node %d (%s) not supported by the backend\n", __func__, idx,

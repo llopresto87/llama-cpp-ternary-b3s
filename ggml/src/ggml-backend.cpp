@@ -624,6 +624,8 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    }
+
     return device->iface.supports_op(device, op);
 }
 
@@ -883,9 +885,11 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     }
 
     // find highest prio backend that supports the buffer type and the op
+    // GGML_OP_NONE tensors are pure data containers (no operation to execute),
+    // so any backend that owns the buffer type is valid regardless of op support.
     for (int i = 0; i < sched->n_backends; i++) {
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
-            ggml_backend_supports_op(sched->backends[i], op)) {
+            (op->op == GGML_OP_NONE || ggml_backend_supports_op(sched->backends[i], op))) {
             return i;
         }
     }

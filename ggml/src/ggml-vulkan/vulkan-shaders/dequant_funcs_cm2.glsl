@@ -54,16 +54,52 @@ float16_t dequantFuncQ2_0(const in decodeBufQ2_0 bl, const in uint blockCoords[2
 {
     const float16_t d = bl.block.d;
     const uint idx = coordInBlock[1];
-    const uint bits = uint(bl.block.qs[idx >> 2]) >> (2u * (idx & 3u));
-    return (float16_t(bits & 3u) - float16_t(1.0)) * d;
+    // 2-bit codes {0,1,2,3} map to {-1,0,+1,+2}
+    const uint q = (uint(bl.block.qs[idx >> 2]) >> ((idx & 0x3u) << 1)) & 0x3u;
+    return d * float16_t(int(q) - 1);
 }
 
 f16vec4 dequantFuncQ2_0_v(const in decodeBufQ2_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
     const float16_t d = bl.block.d;
     const uint idx = coordInBlock[1];
-    const uint bits = uint(bl.block.qs[idx >> 2]);
-    return f16vec4((vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f) * float(d));
+    const uint q = uint(bl.block.qs[idx >> 2]);
+    return f16vec4(
+        d * float16_t(int( q        & 3u) - 1),
+        d * float16_t(int((q >> 2u) & 3u) - 1),
+        d * float16_t(int((q >> 4u) & 3u) - 1),
+        d * float16_t(int( q >> 6u      ) - 1));
+}
+
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ2_B3 {
+   block_q2_b3 block;
+};
+
+// v2 chunk-aligned layout: 32-trit chunk c owns bytes [6c..6c+5] + 2 straggler
+// trits in byte 24+(c>>1) at digit 2*(c&1).
+uint q2b3_byte_cm2(uint j)  { const uint c = j >> 5, t = j & 31u; return t < 30u ? 6u*c + t/5u : 24u + (c >> 1u); }
+uint q2b3_digit_cm2(uint j) { const uint c = j >> 5, t = j & 31u; return t < 30u ? t % 5u : 2u*(c & 1u) + (t - 30u); }
+
+float16_t dequantFuncQ2_B3(const in decodeBufQ2_B3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+    const uint idx = coordInBlock[1];
+    const float16_t d = bl.block.d0;
+    const uint q = (uint(bl.block.qs[q2b3_byte_cm2(idx)]) / pw3[q2b3_digit_cm2(idx)]) % 3u;
+    return d * float16_t(int(q) - 1);
+}
+
+f16vec4 dequantFuncQ2_B3_v(const in decodeBufQ2_B3 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+    const uint idx = coordInBlock[1];
+    const float16_t d = bl.block.d0;
+    f16vec4 v;
+    [[unroll]] for (uint t = 0; t < 4; ++t) {
+        const uint j = idx + t;
+        v[t] = d * float16_t(int((uint(bl.block.qs[q2b3_byte_cm2(j)]) / pw3[q2b3_digit_cm2(j)]) % 3u) - 1);
+    }
+    return v;
 }
 
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ4_0 {
@@ -1391,6 +1427,9 @@ f16vec4 dequantFuncNVFP4_v(const in decodeBufNVFP4 bl, const in uint blockCoords
 #elif defined(DATA_A_Q2_0)
 #define dequantFuncA dequantFuncQ2_0
 #define dequantFuncA_v dequantFuncQ2_0_v
+#elif defined(DATA_A_Q2_B3)
+#define dequantFuncA dequantFuncQ2_B3
+#define dequantFuncA_v dequantFuncQ2_B3_v
 #elif defined(DATA_A_Q4_0)
 #define dequantFuncA dequantFuncQ4_0
 #define dequantFuncA_v dequantFuncQ4_0_v

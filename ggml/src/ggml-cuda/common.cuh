@@ -783,6 +783,42 @@ static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v,
 #endif // FAST_FP16_AVAILABLE
 }
 
+// FP16 dot-and-accumulate for hot inner loops that are issue-bound rather than
+// latency-bound, currently only the flash-attention tile kernel's KQ accumulation.
+//
+// The `ggml_cuda_mad(float &, half2, half2)` overload above reaches
+// `v_dot2_f32_f16` through `asm volatile`. Inline asm is an opaque node to LLVM,
+// so the AMDGPU VOPD-forming pass cannot look inside it and the KQ dots can never
+// be co-issued on RDNA3, no matter how many of them are independent.
+// `__builtin_amdgcn_fdot2` selects the same hardware dot from an ordinary DAG node,
+// which lets that pass pack pairs of them into `v_dual_dot2acc_f32_f16`.
+//
+// The emitted arithmetic is unchanged. `v_dot2_f32_f16 d, a, b, d` (VOP3P, src2 ==
+// dst, default modifiers) and `v_dot2acc_f32_f16 d, a, b` (VOP2) are the same dot
+// product with the same fp32 accumulate into the same destination; only the
+// encoding, and therefore the issue slot, differs.
+//
+// Deliberately a NEW function with exactly one caller rather than a change to the
+// shared overload above: that overload is also reached by mmvf.cu and by four
+// architectures (RDNA2, RDNA4, gfx906, CDNA) that are not present on this host and
+// therefore cannot be measured. For the same reason the fast arm is gated on RDNA3
+// specifically -- VOPD is an RDNA3+ facility, the win is a scheduling win that only
+// exists where VOPD exists, and gfx1100 is the only such target verifiable here.
+// Every other target keeps exactly the code it has today via the fallback below.
+template <typename T_vec_dot>
+static __device__ __forceinline__ void ggml_cuda_mad_dot2(float & acc, const T_vec_dot v, const T_vec_dot u) {
+#if defined(V_DOT2_F32_F16_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(RDNA3)
+    if constexpr (std::is_same_v<T_vec_dot, half2>) {
+        typedef _Float16 ggml_cuda_f16x2 __attribute__((ext_vector_type(2)));
+        acc = __builtin_amdgcn_fdot2(
+            __builtin_bit_cast(ggml_cuda_f16x2, v), __builtin_bit_cast(ggml_cuda_f16x2, u), acc, false);
+    } else
+#endif // defined(V_DOT2_F32_F16_AVAILABLE) && defined(FAST_FP16_AVAILABLE) && defined(RDNA3)
+    {
+        ggml_cuda_mad(acc, v, u);
+    }
+}
+
 // Aligned memory transfers of 8/16 bytes can be faster than 2 transfers with 4 bytes, especially on AMD.
 // Important: do not use this function if dst and src both point at registers.
 //     Due to the strict aliasing rule the compiler can do incorrect optimizations if src and dst have different types.
@@ -821,7 +857,6 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ ds
 
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #if CUDART_VERSION >= 12080
-    const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
     return (float) e;
 #else
     uint32_t bits;
@@ -983,6 +1018,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
     static constexpr int qk = QK2_0;
     static constexpr int qr = QR2_0;
     static constexpr int qi = QI2_0;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_B3> {
+    static constexpr int qk = QK2_B3;
+    static constexpr int qr = QR2_B3;
+    static constexpr int qi = QI2_B3;
 };
 
 template<>
@@ -1416,6 +1458,38 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // q8_1 activation-quantization cache, valid for exactly ONE graph evaluation.
+    //
+    // A batch-1 decode step issues one src1->q8_1 quantization per matmul, but many matmuls
+    // read the same activation vector: measured on Ternary-Bonsai-27B, 432 matmuls against
+    // only 257 distinct src1 nodes per token, i.e. ~175 redundant quantizations, each
+    // costing a ~1.2 us kernel plus ~3.9 us of dispatch serialization.  A speculative verify
+    // step carries exactly the same redundancy over ne11 = n_draft + 1 activation columns,
+    // so the entry records the WIDTH it was built at and the element count it was allocated
+    // with: the buffer is sized by ne11, and handing a narrow entry to a wider consumer is
+    // an out-of-bounds device read with no fault.
+    //
+    // Keying on the tensor NODE is what makes this safe. ggml-alloc recycles compute
+    // buffers, so src1->data is NOT a valid identity (the same address holds different
+    // contents at different points in the graph). A tensor node, by contrast, is kept alive
+    // by ggml-alloc from its producer until its last consumer, so two matmuls reading the
+    // same node within one graph necessarily see identical contents.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1;
+        ggml_type           src0_type;
+        int64_t             ne10;
+        int64_t             ne11;        // activation columns this buffer holds
+        size_t              alloc_nelem; // what it was allocated with; a shortfall is a MISS, never a reuse
+        char *              buf;
+    };
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> q8_1_cache_allocs;
+
+    void q8_1_cache_reset() {
+        q8_1_cache.clear();
+        q8_1_cache_allocs.clear();
+    }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

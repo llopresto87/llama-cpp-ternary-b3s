@@ -43,6 +43,26 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
     v.y = (c1 - 1) * d;
 }
 
+static __device__ __forceinline__ void dequantize_q2_b3(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    // base-3 v2 chunk-aligned: 32-trit chunk c owns bytes [6c..6c+5] (5 trits each)
+    // + 2 straggler trits in byte 24+(c>>1) at digit 2*(c&1). iqs is an even element index.
+    const block_q2_b3 * x = (const block_q2_b3 *) vx;
+    const uint8_t * qs = x[ib].qs;
+    const int pw3[5] = {1,3,9,27,81};
+    int code[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+        const int j = iqs + e;
+        const int c = j >> 5, t = j & 31;
+        const int byte  = (t < 30) ? (6*c + t/5) : (24 + (c>>1));
+        const int digit = (t < 30) ? (t % 5)     : (2*(c&1) + (t-30));
+        code[e] = ((int)qs[byte] / pw3[digit]) % 3;
+    }
+    const float d = (float) x[ib].d;   // single scale for all 128 values
+    v.x = (code[0] - 1) * d;
+    v.y = (code[1] - 1) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;
 

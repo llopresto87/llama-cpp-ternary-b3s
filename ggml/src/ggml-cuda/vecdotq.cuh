@@ -112,6 +112,9 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
 
+#define VDR_Q2_B3_Q8_1_MMVQ 1 // one 32-element chunk per call (QI2_B3 = 4 chunks/block)
+#define VDR_Q2_B3_Q8_1_MMQ  2 // decodes to a q8_0-shaped int8 tile, reuses q8_0's vec_dot
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
@@ -761,6 +764,100 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     // Apply Q2_0's single scale and this chunk's Q8_1 scale
     const float d8 = __low2float(bq8_1_chunk->ds);
     return d2 * d8 * sumi;
+}
+
+// byte -> 5 trits packed 2 bits each (compile-time; no runtime base-3 division).
+static __device__ __constant__ const uint16_t ggml_cuda_b3lut[256] = {
+    0, 1, 2, 4, 5, 6, 8, 9, 10, 16, 17, 18, 20, 21, 22, 24,
+    25, 26, 32, 33, 34, 36, 37, 38, 40, 41, 42, 64, 65, 66, 68, 69,
+    70, 72, 73, 74, 80, 81, 82, 84, 85, 86, 88, 89, 90, 96, 97, 98,
+    100, 101, 102, 104, 105, 106, 128, 129, 130, 132, 133, 134, 136, 137, 138, 144,
+    145, 146, 148, 149, 150, 152, 153, 154, 160, 161, 162, 164, 165, 166, 168, 169,
+    170, 256, 257, 258, 260, 261, 262, 264, 265, 266, 272, 273, 274, 276, 277, 278,
+    280, 281, 282, 288, 289, 290, 292, 293, 294, 296, 297, 298, 320, 321, 322, 324,
+    325, 326, 328, 329, 330, 336, 337, 338, 340, 341, 342, 344, 345, 346, 352, 353,
+    354, 356, 357, 358, 360, 361, 362, 384, 385, 386, 388, 389, 390, 392, 393, 394,
+    400, 401, 402, 404, 405, 406, 408, 409, 410, 416, 417, 418, 420, 421, 422, 424,
+    425, 426, 512, 513, 514, 516, 517, 518, 520, 521, 522, 528, 529, 530, 532, 533,
+    534, 536, 537, 538, 544, 545, 546, 548, 549, 550, 552, 553, 554, 576, 577, 578,
+    580, 581, 582, 584, 585, 586, 592, 593, 594, 596, 597, 598, 600, 601, 602, 608,
+    609, 610, 612, 613, 614, 616, 617, 618, 640, 641, 642, 644, 645, 646, 648, 649,
+    650, 656, 657, 658, 660, 661, 662, 664, 665, 666, 672, 673, 674, 676, 677, 678,
+    680, 681, 682, 0, 1, 2, 4, 5, 6, 8, 9, 10, 16, 17, 18, 20,
+};
+
+// Pre-expanded q2_b3 byte LUT for the RDNA3 decode fast path. For each packed byte value,
+// the low four trits (t0..t3) are spread one-per-int8-lane at bits 0,8,16,24 (each value in
+// {0,1,2}); the fifth trit (t4) is parked in the free high bits 30..31 of the same word.
+// This lets the bespoke decode kernel assemble the eight dp4a code-words with a handful of
+// shift/mask/or ops instead of a per-element 2-bit LUT gather, closing the base-3 ALU gap
+// vs q2_0. Derived byte-for-byte from ggml_cuda_b3lut above; the dp4a int8 dot stays exact,
+// so decode output is bit-identical.
+static __device__ __constant__ const uint32_t ggml_cuda_b3lut_x[256] = {
+    0x00000000u, 0x00000001u, 0x00000002u, 0x00000100u, 0x00000101u, 0x00000102u, 0x00000200u, 0x00000201u,
+    0x00000202u, 0x00010000u, 0x00010001u, 0x00010002u, 0x00010100u, 0x00010101u, 0x00010102u, 0x00010200u,
+    0x00010201u, 0x00010202u, 0x00020000u, 0x00020001u, 0x00020002u, 0x00020100u, 0x00020101u, 0x00020102u,
+    0x00020200u, 0x00020201u, 0x00020202u, 0x01000000u, 0x01000001u, 0x01000002u, 0x01000100u, 0x01000101u,
+    0x01000102u, 0x01000200u, 0x01000201u, 0x01000202u, 0x01010000u, 0x01010001u, 0x01010002u, 0x01010100u,
+    0x01010101u, 0x01010102u, 0x01010200u, 0x01010201u, 0x01010202u, 0x01020000u, 0x01020001u, 0x01020002u,
+    0x01020100u, 0x01020101u, 0x01020102u, 0x01020200u, 0x01020201u, 0x01020202u, 0x02000000u, 0x02000001u,
+    0x02000002u, 0x02000100u, 0x02000101u, 0x02000102u, 0x02000200u, 0x02000201u, 0x02000202u, 0x02010000u,
+    0x02010001u, 0x02010002u, 0x02010100u, 0x02010101u, 0x02010102u, 0x02010200u, 0x02010201u, 0x02010202u,
+    0x02020000u, 0x02020001u, 0x02020002u, 0x02020100u, 0x02020101u, 0x02020102u, 0x02020200u, 0x02020201u,
+    0x02020202u, 0x40000000u, 0x40000001u, 0x40000002u, 0x40000100u, 0x40000101u, 0x40000102u, 0x40000200u,
+    0x40000201u, 0x40000202u, 0x40010000u, 0x40010001u, 0x40010002u, 0x40010100u, 0x40010101u, 0x40010102u,
+    0x40010200u, 0x40010201u, 0x40010202u, 0x40020000u, 0x40020001u, 0x40020002u, 0x40020100u, 0x40020101u,
+    0x40020102u, 0x40020200u, 0x40020201u, 0x40020202u, 0x41000000u, 0x41000001u, 0x41000002u, 0x41000100u,
+    0x41000101u, 0x41000102u, 0x41000200u, 0x41000201u, 0x41000202u, 0x41010000u, 0x41010001u, 0x41010002u,
+    0x41010100u, 0x41010101u, 0x41010102u, 0x41010200u, 0x41010201u, 0x41010202u, 0x41020000u, 0x41020001u,
+    0x41020002u, 0x41020100u, 0x41020101u, 0x41020102u, 0x41020200u, 0x41020201u, 0x41020202u, 0x42000000u,
+    0x42000001u, 0x42000002u, 0x42000100u, 0x42000101u, 0x42000102u, 0x42000200u, 0x42000201u, 0x42000202u,
+    0x42010000u, 0x42010001u, 0x42010002u, 0x42010100u, 0x42010101u, 0x42010102u, 0x42010200u, 0x42010201u,
+    0x42010202u, 0x42020000u, 0x42020001u, 0x42020002u, 0x42020100u, 0x42020101u, 0x42020102u, 0x42020200u,
+    0x42020201u, 0x42020202u, 0x80000000u, 0x80000001u, 0x80000002u, 0x80000100u, 0x80000101u, 0x80000102u,
+    0x80000200u, 0x80000201u, 0x80000202u, 0x80010000u, 0x80010001u, 0x80010002u, 0x80010100u, 0x80010101u,
+    0x80010102u, 0x80010200u, 0x80010201u, 0x80010202u, 0x80020000u, 0x80020001u, 0x80020002u, 0x80020100u,
+    0x80020101u, 0x80020102u, 0x80020200u, 0x80020201u, 0x80020202u, 0x81000000u, 0x81000001u, 0x81000002u,
+    0x81000100u, 0x81000101u, 0x81000102u, 0x81000200u, 0x81000201u, 0x81000202u, 0x81010000u, 0x81010001u,
+    0x81010002u, 0x81010100u, 0x81010101u, 0x81010102u, 0x81010200u, 0x81010201u, 0x81010202u, 0x81020000u,
+    0x81020001u, 0x81020002u, 0x81020100u, 0x81020101u, 0x81020102u, 0x81020200u, 0x81020201u, 0x81020202u,
+    0x82000000u, 0x82000001u, 0x82000002u, 0x82000100u, 0x82000101u, 0x82000102u, 0x82000200u, 0x82000201u,
+    0x82000202u, 0x82010000u, 0x82010001u, 0x82010002u, 0x82010100u, 0x82010101u, 0x82010102u, 0x82010200u,
+    0x82010201u, 0x82010202u, 0x82020000u, 0x82020001u, 0x82020002u, 0x82020100u, 0x82020101u, 0x82020102u,
+    0x82020200u, 0x82020201u, 0x82020202u, 0x00000000u, 0x00000001u, 0x00000002u, 0x00000100u, 0x00000101u,
+    0x00000102u, 0x00000200u, 0x00000201u, 0x00000202u, 0x00010000u, 0x00010001u, 0x00010002u, 0x00010100u,
+};
+
+// Ternary q2_b3: 128 weights, ONE f16 scale, base-3 v2
+// chunk-aligned packing. iqs selects the 32-element chunk (0..3). LUT decode.
+static __device__ __forceinline__ float vec_dot_q2_b3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q2_b3 * bq  = (const block_q2_b3 *) vbq + kbx;
+    const block_q8_1  * bq8 = bq8_1 + iqs;
+
+    const float d  = (float) bq->d;
+    const float d8 = __low2float(bq8->ds);
+    const float s8 = __high2float(bq8->ds);
+
+    const uint8_t * qs = bq->qs;
+    int sumi = 0;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {           // 8 groups of 4 trits = 32 elements
+        int codes = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int j = iqs*32 + g*4 + e;
+            const int c = j >> 5, t = j & 31;
+            const int byte  = (t < 30) ? (6*c + t/5) : (24 + (c>>1));
+            const int digit = (t < 30) ? (t % 5)     : (2*(c&1) + (t-30));
+            const int code  = (ggml_cuda_b3lut[qs[byte]] >> (2*digit)) & 0x3;
+            codes |= (code & 0xff) << (8*e);
+        }
+        const int u = get_int_b4(bq8->qs, g);
+        sumi = ggml_cuda_dp4a(codes, u, sumi);
+    }
+    return d * (d8 * sumi - s8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(

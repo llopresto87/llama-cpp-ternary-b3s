@@ -223,7 +223,7 @@ struct block_q2_0
 struct block_q2_0_packed16
 {
     float16_t d;
-    uint16_t qs[QUANT_K_Q2_0 / 8];
+    uint16_t qs[QUANT_K_Q2_0 / 4 / 2];
 };
 
 #if defined(DATA_A_Q2_0)
@@ -232,7 +232,49 @@ struct block_q2_0_packed16
 #define QUANT_AUXF 1
 #define A_TYPE block_q2_0
 #define A_TYPE_PACKED16 block_q2_0_packed16
-#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_Q2_B3 128
+#define QUANT_R_Q2_B3 1
+
+struct block_q2_b3
+{
+    float16_t d0;           // single scale for all 128 values
+    uint8_t qs[26];         // base-3 packed, v2 chunk-aligned
+};
+
+struct block_q2_b3_packed16
+{
+    float16_t d0;
+    uint16_t qs[13];
+};
+
+#if defined(DATA_A_Q2_B3)
+#define QUANT_K QUANT_K_Q2_B3
+#define QUANT_R QUANT_R_Q2_B3
+#define QUANT_AUXF 1
+#define A_TYPE block_q2_b3
+#define A_TYPE_PACKED16 block_q2_b3_packed16
+
+// byte -> five base-3 digits as 2-bit crumbs (10 bits), computed once per WG
+shared uint16_t b3_lut[243];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize)
+{
+    for (uint i = gl_LocalInvocationIndex.x; i < 243; i += wgsize.x) {
+        const uint c0 = i % 3u;
+        const uint r0 = i / 3u;
+        const uint c1 = r0 % 3u;
+        const uint r1 = r0 / 3u;
+        const uint c2 = r1 % 3u;
+        const uint r2 = r1 / 3u;
+        const uint c3 = r2 % 3u;
+        const uint c4 = r2 / 3u;
+        b3_lut[i] = uint16_t(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6) | (c4 << 8));
+    }
+    barrier();
+}
 #endif
 
 #define QUANT_K_Q8_1 32

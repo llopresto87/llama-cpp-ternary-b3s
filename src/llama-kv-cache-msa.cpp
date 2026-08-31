@@ -34,7 +34,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter, reuse, nullptr);
+            n_swa, 0, swa_type, nullptr, filter, reuse, nullptr);
 
     // the MSA indexer uses a single key head per layer
     std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
@@ -46,7 +46,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_idx = std::make_unique<llama_kv_cache>(
             model, hparams_idx, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
+            n_swa, 0, swa_type, nullptr, filter_idx, reuse, nullptr);
 }
 
 void llama_kv_cache_msa::clear(bool data) {
@@ -385,7 +385,7 @@ void llama_kv_cache_msa_context::set_input_pos_mask(ggml_tensor * dst, const lla
             }
 
             // apply SWA if any
-            if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+            if (llama_hparams::is_masked_swa(n_swa, 0, swa_type, p0, p1)) {
                 continue;
             }
 

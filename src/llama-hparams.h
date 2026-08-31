@@ -6,12 +6,18 @@
 #include <bitset>
 #include <cassert>
 #include <cmath>
+#include <string>
+#include <utility>
+#include <vector>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
 #define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
 #define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
+
+// the default ladder is deliberately five entries. The cap only exists because
+// the ladder has to live in a trivially-copyable llama_hparams.
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
@@ -160,6 +166,8 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
+    // the number of initial positions that the sliding window never masks (0 - no attention sinks)
+    uint32_t n_sink = 0;
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)
@@ -169,6 +177,15 @@ struct llama_hparams {
 
     // for hybrid state space models
     std::array<uint32_t, LLAMA_MAX_LAYERS> is_recr_impl;
+
+    // swa_type, and setting both knob families is a load failure (§4.M).
+
+    // the compiled kernel specializations for K, strictly ascending. A fixed
+    // array rather than a vector because llama_hparams must stay trivially
+
+    // every other attention layer is exact. Indexed by the ABSOLUTE layer index,
+    // exactly like is_swa_impl, while the knob that fills it is written in
+    // attention-layer ordinals (§6.2 - the asymmetry is deliberate).
 
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
@@ -370,6 +387,59 @@ struct llama_hparams {
 
     bool is_indexer_full(uint32_t il) const;
 
+    // resolve the experimental sliding-window knobs (TQ_SWA_WINDOW / TQ_SWA_SINK /
+    // TQ_SWA_LAYERS) into n_swa, n_sink, swa_type, is_swa_impl[] and the two
+    // rope_freq_*_train_swa fields. A null pointer means the variable is unset, and all
+    // three unset is the default: nothing is written and the model loads exactly as it
+    // does without this call.
+    // The windowed set is selected over the ATTENTION-LAYER ORDINAL - the k-th layer with
+    // !is_recr(il) - never over il itself, and is read from is_recr_impl[] rather than
+    // re-derived from any layer pattern. set_swa_pattern() is a modulo over every layer
+    // and cannot express such a subset.
+    // Malformed input throws, naming the variable and the offending value, and leaves the
+    // hparams untouched: a half-applied window is worse than a rejected one.
+    void apply_swa_knobs(const char * env_window, const char * env_sink, const char * env_layers);
+
+    // check the SWA invariants at load time, upstream of every consumer. The llama_kv_cache
+    // constructor asserts the sink/geometry invariant too, but a model that never builds a
+    // cache never reaches it. Throws naming the offending quantity.
+    void validate_swa() const;
+
+    // A null pointer means the variable is UNSET; "" means set and empty, and the two are
+    // different - getenv reports an unexpanded shell variable as "", and reading it as
+    // "off" would run full attention under a selection the operator believes is in force.
+    // about the same layers, so setting both fails too.
+    // The selected set is read over the ATTENTION-LAYER ORDINAL - the k-th layer with
+    // !is_recr(il) - never over il itself, for the whole layer knob and not only for
+    // even/odd: on this model every attention il is odd, so an absolute reading is wrong
+    // in a way that looks right.
+    // Malformed input throws, naming the variable and the offending value, and leaves the
+    // hparams untouched: never a fallback, never a clamp, never a warning.
+    // so it must not route through the iswa memory module (§4.M).
+                         const char * env_ladder,
+                         const char * env_page,
+                         const char * env_layers,
+                         const char * env_window,
+                         const char * env_sink,
+                         const char * env_prefill,
+                         const char * env_stats);
+
+    // It reports the RESOLVED set both ways: the attention-layer ordinals the operator
+    // wrote and the ABSOLUTE il values the run actually sparsified. Printing only the
+    // ordinal list (or only the raw knob string) is what §7.V cost: the core-5/core-7
+    // divergence was visible solely as a KV-buffer size delta.
+    // presence-tests the environment itself - so it is passed in by the caller rather
+    // than stored a second time here, where the two copies could disagree.
+
+    // the §4.N prefill notice, as the prose lines print_info emits after the §4.R banner.
+    // number must carry.
+    // out of the same log stream by scripts/tests/gate_retrieval_depth.py, and a prose notice
+    // wearing that shape would be absorbed into the attested configuration.
+
+    // return true if one of the layers selects its distant pages by content
+
+    // note: the ABSOLUTE layer index, mirroring is_swa(il)
+
     void set_recr_pattern(uint32_t n_pattern, bool dense_first = false);
 
     // whether or not the given layer is recurrent (for hybrid models)
@@ -435,10 +505,16 @@ struct llama_hparams {
     uint32_t n_layer() const;
 
     // note that this function uses different SWA parameters from those in the hparams
+    // note: n_sink is the number of initial positions that are never masked (attention sinks, so
+    //       that evicting position 0 cannot collapse the model). It applies to
+    //       LLAMA_SWA_TYPE_STANDARD only - the chunked and symmetric windows have a different
+    //       geometry and no caller needs sinks there. At n_sink == 0 the sink term is a
+    //       tautology for every p0, so the predicate is exactly the plain window it was before
+    //       sinks existed - for out-of-contract inputs too, not just p0 >= 0 (see the cast).
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function
     // TODO: pack the SWA params in a struct?
-    static bool is_masked_swa(uint32_t n_swa, llama_swa_type swa_type, llama_pos p0, llama_pos p1) {
+    static bool is_masked_swa(uint32_t n_swa, uint32_t n_sink, llama_swa_type swa_type, llama_pos p0, llama_pos p1) {
         assert(p0 >= 0 && p1 >= 0);
 
         switch (swa_type) {
@@ -447,7 +523,11 @@ struct llama_hparams {
                 } break;
             case LLAMA_SWA_TYPE_STANDARD:
                 {
-                    if (p1 - p0 >= (int32_t) n_swa) {
+                    // note: the unsigned compare keeps a negative p0 - which violates the
+                    //       precondition above, but is not rejected in a release build - masked
+                    //       exactly as it was before sinks existed: it wraps to a large value,
+                    //       the sink term drops out, and the plain window alone decides
+                    if ((uint32_t) p0 >= n_sink && p1 - p0 >= (int32_t) n_swa) {
                         return true;
                     }
                 } break;

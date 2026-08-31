@@ -704,6 +704,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // Return the q8_1 activation cache's pool buffers before any member is destroyed. The
+    // cache is reset at the start of each graph, so the buffers of the LAST graph are still
+    // checked out here; `pools` is declared last and would otherwise be destroyed first,
+    // taking ~ggml_cuda_pool_leg()'s GGML_ASSERT(pool_size == 0) with it.
+    q8_1_cache_reset();
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -3283,6 +3289,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // A run of INDEPENDENT ternary MUL_MATs that read the same activation vector, issued as
+    // one dispatch over the concatenation of their rows. Small GEMVs cannot amortize their
+    // launch ramp, so the lever is a bigger dispatch (mmvq.cuh, TQ_CUDA_MULTI_MAX).
+    if (node->op == GGML_OP_MUL_MAT) {
+        static const bool pair_disabled = getenv("TQ_HIP_NO_PAIR") != nullptr;
+        if (!pair_disabled) {
+            ggml_tensor * group[TQ_CUDA_MULTI_MAX];
+            int n_group = 0;
+            group[n_group++] = cgraph->nodes[i];
+            int last = i;
+
+            for (int j = i + 1; j < cgraph->n_nodes && n_group < TQ_CUDA_MULTI_MAX; ++j) {
+                ggml_tensor * n = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(n)) {
+                    // Tolerated only if it is a view of something already in the group;
+                    // anything else would be unrelated work we would silently drop.
+                    bool of_group = false;
+                    for (int g = 0; g < n_group && !of_group; ++g) {
+                        of_group = (n->view_src == group[g]) || (n->src[0] == group[g]);
+                    }
+                    if (!of_group) {
+                        break;
+                    }
+                    continue;
+                }
+                if (n->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_q_pair(group[0], n)) {
+                    group[n_group++] = n;
+                    last = j;
+                    continue;
+                }
+                break;
+            }
+
+            if (n_group >= 2) {
+                ggml_cuda_mul_mat_vec_q_multi(*cuda_ctx, group, n_group);
+                return last - i; // consumes nodes i..last inclusive
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -4249,6 +4295,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // The q8_1 activation cache is only valid within a single graph evaluation: tensor-node
+    // identity guarantees identical contents inside one graph, never across graphs.
+    cuda_ctx->q8_1_cache_reset();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4673,6 +4723,47 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     }
 }
 
+// backend's own stream and synchronizes, so the caller can read the bounds back
+// immediately; it is a test entry point, not a hot path.
+        ggml_backend_t backend, const ggml_tensor * K, ggml_tensor * bounds,
+        int page_size, int page_first, int page_last) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+}
+
+        ggml_backend_t backend, ggml_tensor * KV_pages, const ggml_tensor * bounds,
+        const ggml_tensor * Q, int n_lists, int list_stride, int list_off,
+        int n_pages, int n_pages_stride, int n_kv, int page_size, int block_tokens,
+        int n_blocks, int top_k, int n_sink_pages, int window, float scale) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    GGML_ASSERT(bounds->type   == GGML_TYPE_F16);
+    GGML_ASSERT(KV_pages->type == GGML_TYPE_I32);
+    GGML_ASSERT(Q->type        == GGML_TYPE_F32);
+    GGML_ASSERT(bounds->ne[0] % 2 == 0);
+
+    const int n_channels = (int) bounds->ne[0] / 2;
+    const int n_head_kv  = (int) bounds->ne[2];
+    const int n_head     = (int) Q->ne[2];
+    GGML_ASSERT(Q->ne[0] == n_channels);
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+        cuda_ctx->stream(),
+        (int *) KV_pages->data, bounds->data, (const char *) Q->data, nullptr,
+        n_lists, list_stride, list_off,
+        n_pages, n_pages_stride,
+        n_kv, n_channels, n_head_kv,
+        page_size, block_tokens, n_blocks,
+        top_k, n_sink_pages, window,
+        n_head, Q->nb[1], Q->nb[2], scale);
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+}
+
 
 // backend device
 
@@ -4951,6 +5042,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_Q2_B3:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
@@ -4990,6 +5082,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_Q2_B3:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:

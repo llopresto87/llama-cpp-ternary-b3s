@@ -27,6 +27,7 @@ public:
                  uint32_t   kv_size,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
+                 uint32_t   n_sink,
            llama_swa_type   swa_type,
                             /* recurrent */
                 ggml_type   type_r,

@@ -30,6 +30,10 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+void quantize_row_q2_b3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_b3_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -211,6 +215,57 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
                 sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
                 sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
                 sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// Ternary q2_b3: 128 weights per block, ONE f16 scale, base-3 v2 chunk-aligned packing.
+// Chunk c (32 trits) owns bytes [6c .. 6c+5] at 5 trits/byte, plus two straggler trits in
+// the shared byte 24+(c>>1) at digit offset 2*(c&1). Trit codes {0,1,2} -> weight (t-1)*d.
+// One q2_b3 block maps to four q8_0 blocks (4 * 32 == 128). This is the CPU reference the
+// CUDA/HIP b3lut decoders must match; it mirrors dequantize_q2_b3 in ggml-cuda.
+void ggml_vec_dot_q2_b3_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_B3;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_b3 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    static const int pw3[5] = {1, 3, 9, 27, 81};
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+
+        float sumi = 0.0f;
+
+        for (int c = 0; c < 4; c++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + c];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const int8_t * GGML_RESTRICT qy = yb->qs;
+
+            int sumi_block = 0;
+            for (int t = 0; t < 32; ++t) {
+                const int byte  = (t < 30) ? (6*c + t/5) : (24 + (c >> 1));
+                const int digit = (t < 30) ? (t % 5)     : (2*(c & 1) + (t - 30));
+                const int trit  = ((int) qs[byte] / pw3[digit]) % 3;
+                sumi_block += (trit - 1) * qy[t];
             }
 
             sumi += d1 * sumi_block;

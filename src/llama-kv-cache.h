@@ -108,6 +108,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_pad,
                      uint32_t   n_swa,
+                     uint32_t   n_sink,
                llama_swa_type   swa_type,
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
@@ -187,6 +188,8 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // whether to attach a sixth src at all.
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -257,6 +260,11 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // in the cache's own buffer, rather than in the graph allocator, because
+        // §6.5 requires it to be append-only across steps: a graph-allocated
+        // tensor is rebuilt every step, which is the O(context) scan §6.5 exists
+        // to forbid. ne = [2*n_embd_head_k, n_pages_max, n_head_kv, n_stream], f16.
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -269,6 +277,9 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // the number of initial positions this cache's window never masks (attention sinks)
+    const uint32_t n_sink = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
@@ -317,6 +328,11 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // [row_first, row_last_p1) INVALID, by writing the inverted-interval
+    // sentinel (k_min = +INF, k_max = -INF) into its §6.3 record.
+    //
+    // axis on both sides of the launch boundary (ADR-0024). Cheap and a no-op
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

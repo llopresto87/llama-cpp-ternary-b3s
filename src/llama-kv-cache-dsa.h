@@ -25,6 +25,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_pad,
                      uint32_t   n_swa,
+                     uint32_t   n_sink,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter_mla,
         const layer_filter_cb & filter_lid,

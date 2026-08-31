@@ -236,6 +236,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q2_B3] = {
+        .from_float               = quantize_row_q2_b3,
+        .vec_dot                  = ggml_vec_dot_q2_b3_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -3447,25 +3453,21 @@ void ggml_cpu_fp32_to_fp16(const float * x, ggml_fp16_t * y, int64_t n) {
 #if defined(__AVX512F__)
     for (; i + 15 < n; i += 16) {
         __m512 x_vec = _mm512_loadu_ps(x + i);
-        __m256i y_vec = _mm512_cvtps_ph(x_vec, _MM_FROUND_TO_NEAREST_INT);
         _mm256_storeu_si256((__m256i *)(y + i), y_vec);
     }
 #endif
     for (; i + 7 < n; i += 8) {
         __m256 x_vec = _mm256_loadu_ps(x + i);
-        __m128i y_vec = _mm256_cvtps_ph(x_vec, _MM_FROUND_TO_NEAREST_INT);
         _mm_storeu_si128((__m128i *)(y + i), y_vec);
     }
     for (; i + 3 < n; i += 4) {
         __m128 x_vec = _mm_loadu_ps(x + i);
-        __m128i y_vec = _mm_cvtps_ph(x_vec, _MM_FROUND_TO_NEAREST_INT);
         _mm_storel_epi64((__m128i *)(y + i), y_vec);
     }
 #elif defined(__riscv_zvfh)
     for (int vl; i < n; i += vl) {
         vl = __riscv_vsetvl_e32m2(n - i);
         vfloat32m2_t vx = __riscv_vle32_v_f32m2(&x[i], vl);
-        vfloat16m1_t vy = __riscv_vfncvt_f_f_w_f16m1(vx, vl);
         __riscv_vse16_v_f16m1((_Float16 *)&y[i], vy, vl);
     }
 #endif
@@ -3480,18 +3482,15 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
 #if defined(__AVX512F__)
     for (; i + 15 < n; i += 16) {
         __m256i x_vec = _mm256_loadu_si256((const __m256i *)(x + i));
-        __m512 y_vec = _mm512_cvtph_ps(x_vec);
         _mm512_storeu_ps(y + i, y_vec);
     }
 #endif
     for (; i + 7 < n; i += 8) {
         __m128i x_vec = _mm_loadu_si128((const __m128i *)(x + i));
-        __m256 y_vec = _mm256_cvtph_ps(x_vec);
         _mm256_storeu_ps(y + i, y_vec);
     }
     for (; i + 3 < n; i += 4) {
         __m128i x_vec = _mm_loadl_epi64((const __m128i *)(x + i));
-        __m128 y_vec = _mm_cvtph_ps(x_vec);
         _mm_storeu_ps(y + i, y_vec);
     }
 
@@ -3504,11 +3503,9 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
     // unroll by 2
     for (; i < np; i += step) {
         vfloat16m2_t ax0 = __riscv_vle16_v_f16m2((const _Float16*)x + i, epr);
-        vfloat32m4_t ay0 = __riscv_vfwcvt_f_f_v_f32m4(ax0, epr);
         __riscv_vse32_v_f32m4(y + i, ay0, epr);
 
         vfloat16m2_t ax1 = __riscv_vle16_v_f16m2((const _Float16*)x + i + epr, epr);
-        vfloat32m4_t ay1 = __riscv_vfwcvt_f_f_v_f32m4(ax1, epr);
         __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
     }
 
@@ -3517,7 +3514,6 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
     for (i = np; i < n; i += vl) {
         vl = __riscv_vsetvl_e16m2(n - i);
         vfloat16m2_t ax0 = __riscv_vle16_v_f16m2((const _Float16*)x + i, vl);
-        vfloat32m4_t ay0 = __riscv_vfwcvt_f_f_v_f32m4(ax0, vl);
         __riscv_vse32_v_f32m4(y + i, ay0, vl);
     }
 
@@ -3550,7 +3546,6 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
         _mm512_storeu_ps(y + i,
                         _mm512_castsi512_ps(
                             _mm512_slli_epi32(
-                                _mm512_cvtepu16_epi32(
                                     _mm256_loadu_si256(
                                         (const __m256i *)(x + i))),
                                 16)));
@@ -3560,7 +3555,6 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
         _mm256_storeu_ps(y + i,
                         _mm256_castsi256_ps(
                             _mm256_slli_epi32(
-                                _mm256_cvtepu16_epi32(
                                     _mm_loadu_si128(
                                         (const __m128i *)(x + i))),
                                 16)));
@@ -3574,11 +3568,9 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
     // unroll by 2
     for (; i < np; i += step) {
         vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16*)x + i, epr);
-        vfloat32m4_t ay0 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax0, epr);
         __riscv_vse32_v_f32m4(y + i, ay0, epr);
 
         vbfloat16m2_t ax1 = __riscv_vle16_v_bf16m2((const __bf16*)x + i + epr, epr);
-        vfloat32m4_t ay1 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax1, epr);
         __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
     }
 
@@ -3587,7 +3579,6 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
     for (i = np; i < n; i += vl) {
         vl = __riscv_vsetvl_e16m2(n - i);
         vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16*)x + i, vl);
-        vfloat32m4_t ay0 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax0, vl);
         __riscv_vse32_v_f32m4(y + i, ay0, vl);
     }
 #endif

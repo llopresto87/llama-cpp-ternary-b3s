@@ -42,4 +42,6 @@ else()
         add_subdirectory(tuning)
     endif()
     add_subdirectory(results)
+    # offline union study scores; needs a GPU and a model to RUN, nothing special
+    # to BUILD.
 endif()

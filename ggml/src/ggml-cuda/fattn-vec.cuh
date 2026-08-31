@@ -1,13 +1,38 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
-static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc) {
+#include <string>
+#include <mutex>
+#include <map>
+
+// RDNA3 + large head size + quantized K: a 64-thread block (2 waves) measures faster than the
+// default 128 even though the compiler then uses more VGPRs per wave (196 vs 143, occupancy
+// 7 vs 10 waves/SIMD). The win comes from block granularity, not occupancy: launch_fattn splits
+// the KV cache over blocks.y, so halving the block doubles the number of independent KV
+// partitions that fit, which is what fills the CUs during single-token decode where there are
+// only gqa_ratio*n_kv_head == 24 output tiles. Measured at d16384, q4_0 KV, tg64 (t/s):
+//   block size   32      64      128     256
+//                61.53   62.98   58.38   57.25
+// Restricted to the quantized-K path so the f16/bf16 KV vector kernel is bit-for-bit unchanged,
+// and to RDNA3 so CDNA/NVIDIA keep the upstream 128. Host tests cc and device tests the arch
+// macro; on a multi-arch binary the pair stays consistent because the device code that runs is
+// the one built for the cc the host sees.
+template <int D>
+static int ggml_cuda_fattn_vec_get_nthreads_host(const int cc, const ggml_type type_K) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) && D >= 256 && type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16) {
+        return 64;
+    }
     return 128;
-    GGML_UNUSED(cc);
 }
 
-static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+template <int D>
+static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device(const ggml_type type_K) {
+#if defined(GGML_USE_HIP) && defined(RDNA3)
+    return (D >= 256 && type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16) ? 64 : 128;
+#else
+    GGML_UNUSED(type_K);
     return 128;
+#endif // defined(GGML_USE_HIP) && defined(RDNA3)
 }
 
 // Currently llvm with the amdgcn target does not support unrolling loops
@@ -17,7 +42,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device<D>(type_K), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -73,7 +98,16 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = 2;
+    // RDNA3 with a large head size: 2 threads per quantized K dot makes each thread walk
+    // D/2 elements serially, and the resulting per-thread Q_i32/Q_ds arrays are so large that
+    // the kernel spills (640 bytes/lane of scratch at D == 256). Widening the cooperation
+    // removes the spill; past that point throughput tracks occupancy exactly, and 8 is the
+    // peak. Measured at d16384, q4_0 KV, tg64 t/s, with the compiler's reported occupancy:
+    //   nthreads_KQ_q     2      4      8      16     32
+    //   scratch B/lane   640    692     0      0      0
+    //   waves/SIMD        5      5     10      9      8
+    //   t/s (128-thr)    n/a    n/a   58.38  56.36  52.25
+    constexpr int nthreads_KQ_q = D >= 256 ? 8 : 2;
 #else
     constexpr int nthreads_KQ_q = 4;
 #endif // RDNA
@@ -83,7 +117,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
-    constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
+    constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device<D>(type_K);
     constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
 
@@ -530,17 +564,49 @@ static __global__ void flash_attn_ext_vec(
 #pragma clang diagnostic pop
 #endif // __clang__
 
+// included here (after the nthreads helpers it depends on) rather than defined
+// here so that this file's diff against upstream stays at the two lines below.
+
+//
+// page-bounds record as f16[256] per bound, so for D != 256 there is no metadata
+// contract to honour at all — not "untuned", but undefined. Keeping it out of
+// longer instantiated in the D ∈ {64,80,96,112,128} translation units, which is
+// D=64 logit-softcap trap stubs moved 8 -> 17 instructions when it was) and cuts
+// the added compile time and binary size by the head-size multiplicity.
+//
+// `if constexpr` (not `&&`) is load-bearing: the discarded branch is never
+// instantiated, which is the whole point.
+template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
+    if constexpr (D == 256) {
+    } else {
+        return nullptr;
+    }
+}
+
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host(cc);
+    const int nthreads = ggml_cuda_fattn_vec_get_nthreads_host<D>(cc, type_K);
     const int nwarps   = nthreads / WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
+
+    // `nthreads` is this kernel's per-iteration KV step and therefore the token
+    // recorded"; it is NOT FATTN_KQ_STRIDE and it is NOT the page size B.
+
+    // is not the same as this instantiation being the one that runs.
+    if (getenv("TQ_HIP_FA_SELECT_TRACE") != nullptr) {
+        static std::mutex m; static std::map<std::string,long> c;
+        char b[256];
+                 D, cols_per_block, ggml_type_name(type_K), ggml_type_name(type_V),
+        std::lock_guard<std::mutex> g(m);
+        if (++c[std::string(b)] == 1) { fprintf(stderr, "TQ_FA_VECCASE: %s\n", b); fflush(stderr); }
+    }
+
+        : flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false,
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>

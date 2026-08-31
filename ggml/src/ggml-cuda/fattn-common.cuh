@@ -5,6 +5,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -17,6 +20,35 @@
 // Still, the value range should be shifted as much as necessary but as little as possible.
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+
+// One int32 allocation, self-describing so that the kernel signature is
+//
+//   [0]                 = C, entries reserved per list  (list stride)
+//   [1]                 = O, offset in ints of the list region
+//   [O + i*C + s]       = block start offset in TOKENS, s < n_i,
+//                         STRICTLY ASCENDING
+//
+//   i = (sequence*ntiles_x + jt)*n_head + head        <- the QUERY head
+//
+// Block starts are multiples of the consuming kernel's per-iteration KV step
+// unit selection RANKS in, a block is the unit the kernel LOADS in. The
+// producer emits the union of the selected pages over blocks, which is a
+
+// Per-query-head indexing means a GQA-group union is expressible without any
+// kernel change: the producer writes the same list to all query heads of a
+// group. The kernel does not know or care which policy produced the list.
+    int n_lists;   // nseq * ntiles_x * n_head
+    int stride;    // C
+    int list_off;  // O
+    int total;     // ints to allocate
+};
+
+        const int nseq, const int ntiles_x, const int n_head, const int capacity) {
+    l.n_lists  = nseq * ntiles_x * n_head;
+    l.stride   = capacity;
+    l.total    = l.list_off + l.n_lists * l.stride;
+    return l;
+}
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
@@ -718,6 +750,34 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+//
+// *** PLUMBING PRODUCER, NOT THE SELECTOR. ***
+// It writes the DEGENERATE list -- every block, every head, ascending -- which
+// byte-identical before the real selector exists, so that §4.K can later be
+// proven RED against it (a build that selects but does not gate the loads is
+// indistinguishable from this one by output, and distinguishable by bytes
+        int * KV_pages_ptr, const int n_lists, const int stride, const int list_off,
+        const int n_blocks, const int block_tokens) {
+    int * GGML_CUDA_RESTRICT KV_pages = KV_pages_ptr;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        KV_pages[0] = stride;
+        KV_pages[1] = list_off;
+    }
+
+    const int i = blockIdx.x;
+    if (i >= n_lists) {
+        return;
+    }
+    if (threadIdx.x == 0) {
+    }
+
+    int * L = KV_pages + list_off + i*stride;
+    for (int s = threadIdx.x; s < n_blocks; s += blockDim.x) {
+        L[s] = s*block_tokens;
+    }
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -969,10 +1029,444 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// ===========================================================================
+// ===========================================================================
+//
+// One block per LIST, i.e. per (sequence, query tile, QUERY head). 24 blocks at
+// decode. Everything below is shaped by the determinism contract, so read D1-D4
+// before changing any of it.
+//
+// D2 -- fixed reduction shape, no atomics, no cross-wave arrival order.
+//   U_p is computed by ONE thread, entirely: 256 sequential float MACs with no
+//   cross-thread combine at all. That is stronger than choosing a well-behaved
+//   reduction tree -- there is no float reduction to schedule. Threads are
+//   independent across PAGES, never within a page.
+//   The only cross-thread combine anywhere is an INTEGER count during the
+//   threshold search, and integer addition is exactly associative, so its result
+//   cannot depend on arrival order either.
+//
+// D3 -- exact ties break by ascending page index: the emit walk consumes a tie
+//   budget in ascending order, so among equal U_p the lowest page indices win.
+//
+// D4 -- emission is ascending in PAGE index, never rank order. The walk is a
+//   single ascending sweep and rank never touches it. This is what makes §4.Q
+//   byte-identity hold by construction at K >= n_pages (measured: it does).
+//
+// Fail toward attending: an invalid page, an empty page, or a NaN bound yields
+// U_p = +INF, which always selects. Every uncertainty in this kernel resolves to
+// "attend it" (§7.B, §7.D).
+
+// Order-preserving float <-> uint32. Positive floats already compare correctly
+// as integers once the sign bit is set; negatives compare in reverse, so they
+// are inverted. NaN cannot reach here (it is mapped to +INF before the search).
+    uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+    return __uint_as_float((u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u);
+}
+
+// §3.5).
+//
+// WHY THE MASK AND NOT K->ne[1]-1
+//
+// K->ne[1] is the cache's PADDED length: llama_kv_cache::get_n_kv() returns
+// GGML_PAD(used_max_p1, 256), so at the operating point it runs 83 cells past
+// the last real token. Those cells are not the query and they are not attended
+// -- llama_kv_cache sets them to -INF in this very mask. Measuring the resident
+// window from them moves its start UP by ceil(pad/B) pages and costs the window
+// exactly `pad` real tokens of coverage (measured: 941 covered against a
+//
+// The mask is the authoritative per-step statement of which cells this query
+// attends, and the last FINITE entry of its row is the query's own cell: a
+// causal query always attends itself, and every later cell is masked. Reading
+// it here needs no new op_param (op_params are baked into a REUSED graph and
+// cannot carry a per-step quantity) and no new graph input.
+//
+// COST: the masked region is a suffix, so the scan runs BACKWARD in blockDim.x
+// chunks and terminates on the first chunk containing a finite entry -- one
+// iteration of 256 half loads in the steady state, because the padding is < 256
+// cells by construction. The whole-row worst case only occurs if the row is
+// entirely masked, which yields -1 -> everything resident -> fail toward
+// attending (§7).
+//
+// DETERMINISM (D2): the only cross-thread combine is an integer max, which is
+// exactly associative and commutative, so the result cannot depend on arrival
+// order -- the same argument that licenses the integer counts in the threshold
+// search. No float reduction is introduced.
+        const half * mask_row, const int n_kv, int * s_pos_q) {
+    if (threadIdx.x == 0) {
+        *s_pos_q = -1;
+    }
+    __syncthreads();
+
+    if (mask_row == nullptr) {
+        // No mask means every cell of the view is a real, attended cell.
+        if (threadIdx.x == 0) {
+            *s_pos_q = n_kv - 1;
+        }
+        __syncthreads();
+        return *s_pos_q;
+    }
+
+    const int nthreads = blockDim.x;
+    for (int base = ((n_kv - 1)/nthreads)*nthreads; base >= 0; base -= nthreads) {
+        const int j = base + threadIdx.x;
+        if (j < n_kv && __half2float(mask_row[j]) > -INFINITY) {
+            atomicMax(s_pos_q, j);
+        }
+        __syncthreads();
+        // uniform across the block: every thread read the same value after the
+        // barrier, so the loop is exited by all of them together
+        if (*s_pos_q >= 0) {
+            break;
+        }
+    }
+
+    return *s_pos_q;
+}
+
+        int * KV_pages_ptr, const half * bounds, const char * Q_ptr, const half * mask_row,
+        const int n_lists, const int stride, const int list_off,
+        const int n_pages, const int n_pages_stride,
+        const int n_kv, const int n_channels, const int n_head_kv,
+        const int page_size, const int block_tokens, const int n_blocks,
+        const int top_k, const int n_sink_pages, const int window,
+        const int n_head, const size_t nb01, const size_t nb02, const float scale) {
+    int * GGML_CUDA_RESTRICT KV_pages = KV_pages_ptr;
+
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        KV_pages[0] = stride;
+        KV_pages[1] = list_off;
+    }
+
+    const int i = blockIdx.x;
+    if (i >= n_lists) {
+        return;
+    }
+    const int head    = i % n_head;                       // QUERY head
+    const int kv_head = head / (n_head / n_head_kv);      // its KV head (GQA)
+
+    extern __shared__ float smem_U[];                     // n_pages floats
+    __shared__ int   s_cnt[32];
+    __shared__ float s_tau;
+    __shared__ int   s_budget;
+    __shared__ int   s_pos_q;
+
+    // ---- the resident window, from the TRUE query position (§3.5) ----------
+    //
+    // Derived here rather than passed in, because the host cannot see it: the
+    // only host-visible length is the PADDED n_kv, and the padded value is the
+    // are constants from hparams, so they still arrive as parameters.
+    //
+    // Every block recomputes it. That is deliberate: it is one 256-half read in
+    // the steady state, against a KV loop orders of magnitude larger, and it
+    // keeps the value on the same side of the launch boundary as the code that
+    // consumes it -- no second home, no extra launch, no per-step op_param that
+    // a reused graph would serve stale.
+
+    // ---- U_p, one thread per page, no cross-thread combine (D2) -----------
+    const float * q = (const float *) (Q_ptr + (size_t) head*nb02);
+    const half  * rec_base = bounds + (size_t) kv_head*n_pages_stride*2*n_channels;
+
+    for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+        // resident and out-of-range pages never compete for a rank
+        if (p < n_sink_pages || p >= first_window_page) {
+            smem_U[p] = -INFINITY;
+            continue;
+        }
+        const half * kmin = rec_base + (size_t) p*2*n_channels;
+        const half * kmax = kmin + n_channels;
+
+        float u = 0.0f;
+        for (int c = 0; c < n_channels; ++c) {
+            const float qc = q[c]*scale;
+            const float a  = qc*__half2float(kmin[c]);
+            const float b  = qc*__half2float(kmax[c]);
+            u += fmaxf(a, b);
+        }
+        // An INVALIDATED (§4.O) or never-built record must ATTEND. The §6.3
+        // sentinel is the inverted interval k_min = +INF, k_max = -INF, so each
+        // channel contributes max(q_c*(+INF), q_c*(-INF)) -- which is +INF for
+        // q_c != 0 and NaN for q_c == 0. Both routes have to land on the same
+        // value, which is what this line is for; the emit loop below then reads
+        // that value as the residency signal, and INFINITY is the only value it
+        // can test for.
+        smem_U[p] = isnan(u) ? INFINITY : u;
+    }
+    __syncthreads();
+
+    // ---- threshold search: tau = the top_k-th largest ---------------------
+    //
+    // Bisection on the SORTABLE BIT PATTERN, not on the float range. Mapping
+    // float -> uint32 order-preservingly makes 32 integer halvings find tau
+    // EXACTLY, with no dependence on the magnitudes involved; bisecting the
+    // float range instead needs an initial max, and computing that max in
+    // shared memory is where a race would put a run-to-run difference straight
+    // into D1. There is no float reduction here at all -- only integer counts,
+    // which are exactly associative and so order-independent (D2).
+    uint32_t ulo = 0u, uhi = 0xFFFFFFFFu;
+    for (int it = 0; it < 32; ++it) {
+        const uint32_t umid = ulo + ((uhi - ulo) >> 1);
+        int local = 0;
+        for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+        }
+        local = warp_reduce_sum(local);
+        if ((threadIdx.x & 31) == 0) { s_cnt[threadIdx.x >> 5] = local; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int tot = 0;
+            for (int t = 0; t < (int)((blockDim.x + 31)/32); ++t) { tot += s_cnt[t]; }
+            s_budget = tot;
+        }
+        __syncthreads();
+        if (s_budget > top_k) { ulo = umid + 1u; } else { uhi = umid; }
+        __syncthreads();
+        if (ulo >= uhi) { break; }
+    }
+
+    // how many are STRICTLY above tau -- the rest of the quota goes to ties, in
+    // ascending page order (D3)
+    {
+        int local = 0;
+        for (int p = threadIdx.x; p < n_pages; p += blockDim.x) {
+            local += (smem_U[p] > tau) ? 1 : 0;
+        }
+        local = warp_reduce_sum(local);
+        if ((threadIdx.x & 31) == 0) { s_cnt[threadIdx.x >> 5] = local; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int tot = 0;
+            for (int t = 0; t < (int)(blockDim.x + 31)/32; ++t) { tot += s_cnt[t]; }
+            s_budget = top_k - tot;          // tie quota, may be <= 0
+        }
+        __syncthreads();
+    }
+
+    // ---- emit, ASCENDING in page index (D4) -------------------------------
+    //
+    // Serial in one thread: n_pages is at most a few thousand and this runs once
+    // per list per step, against a KV loop that is orders of magnitude larger.
+    // Serial is also what makes the tie budget and the granule union trivially
+    // deterministic -- there is no order to get wrong.
+    if (threadIdx.x == 0) {
+        int  n_emit   = 0;
+        int  budget   = s_budget;
+        int  last_blk = -1;
+        int * L = KV_pages + list_off + i*stride;
+
+        for (int p = 0; p < n_pages; ++p) {
+            bool take = false;
+            //
+            // An INVALIDATED page (§6.3's inverted-interval sentinel, written by
+            // through the isnan force-attend line. That alone would leave it
+            // COMPETING for the top_k budget: once more than top_k pages carry
+            // the sentinel, the bisection returns tau = +INF, `smem_U[p] > tau`
+            // is false for every one of them, and the tie quota admits exactly
+            // top_k in ascending page order -- the rest silently dropped, which
+            // is §4.O violated by its own implementation, in its unsafe
+            // direction. So the invalid page joins the RESIDENT set, budget-
+            // exempt, exactly as sink and window do. One comparison against a
+            // shared-memory value this loop already reads on the next line.
+            if (p < n_sink_pages || p >= first_window_page || smem_U[p] == INFINITY) {
+                take = true;                               // always resident
+            } else if (smem_U[p] > tau) {
+                take = true;
+            } else if (smem_U[p] == tau && budget > 0) {
+                take = true; budget--;
+            }
+            if (!take) {
+                continue;
+            }
+            // page -> granule union. A granule is loaded if ANY covering page is
+            // selected; that is a superset of the selection, never a subset.
+            const int t0 = p*page_size;
+            const int t1 = t0 + page_size;
+            for (int t = t0; t < t1; t += block_tokens) {
+                const int blk = (t / block_tokens)*block_tokens;
+                if (blk != last_blk && n_emit < stride && (blk / block_tokens) < n_blocks) {
+                    L[n_emit++] = blk;
+                    last_blk    = blk;
+                }
+            }
+        }
+        if (n_emit == 0) {                                  // §7.D: never empty
+            L[n_emit++] = 0;
+        }
+    }
+}
+
+// §4.Q's RED CONTROL, and nothing else.
+//
+// Drops one granule from every list. §4.Q's byte-identity is worthless unless a
+// deliberately WRONG selection is shown to break it: if dropping a block leaves
+// the output hash unchanged, the list is not reaching the KV loop and every
+//
+// It drops a MIDDLE entry (n/2), not the last one. Dropping the last was the
+// first attempt and it was WRONG: the list is ascending, n_kv is padded to a
+// multiple of 256, and the prompt is shorter than the allocation -- so the last
+// granule covers cells past the real tokens, which the mask already sets to
+// -INF. Removing them cannot move a bit, and the control silently passed while
+// proving nothing. A middle granule is inside real, unmasked KV.
+// mode 2: keep only the FIRST HALF of the list. Dropping ONE granule turned out
+// to be a control too weak to conclude from -- 64 tokens of mid-context natural
+// text can genuinely carry ~0 softmax weight, so an unchanged hash is consistent
+// BOTH with "the list is ignored" and with "that granule did not matter".
+// Halving the list removes the whole recent half of the context and cannot be
+// absorbed. Use mode 2 to decide plumbing; mode 1 only to probe sensitivity.
+        int * KV_pages_ptr, const int n_lists, const int list_off, const int mode) {
+    const int i = blockIdx.x;
+    if (i >= n_lists || threadIdx.x != 0) {
+        return;
+    }
+    if (mode == 2) {
+        if (*n > 1) {
+            *n /= 2;      // ascending list -> drops the recent half outright
+        }
+        return;
+    }
+    if (*n > 2) {
+        // shift the middle entry out, keeping the list ASCENDING (D4) so the
+        // control tests selection content and not ordering.
+        int * L = KV_pages_ptr + list_off + (size_t) i*KV_pages_ptr[0];
+        const int drop = *n / 2;
+        for (int s = drop; s + 1 < *n; ++s) {
+            L[s] = L[s + 1];
+        }
+        *n -= 1;
+    }
+}
+
+//
+// Today this is the plumbing switch only: unset -> false, so the stock kernel
+// reaching the backend; the shape guards below stay, because they are kernel
+// (§2.2/§4.N gate prefill off) and for one sequence (§2.3 excludes n_seq > 1).
+    // loader -- and the backend simply honours what it was handed.
+    if (dst->src[5] == nullptr) {
+        return false;
+    }
+
+    // specified for single-token decode (§2.2/§4.N gate prefill off) and one
+    // shaped falls back to the stock kernel, which reads all of KV and is
+    // therefore always a safe answer (§7 fail toward attending).
+    const ggml_tensor * Q = dst->src[0];
+    return cols_per_block == 1 && Q->ne[1] == 1 && Q->ne[3] == 1;
+}
+
+// How many pages of this layer's bounds are already FROZEN, keyed by the bounds
+// tensor's device pointer.
+//
+// §4.I completeness is what licenses this: every page below the previous tail is
+// complete and, by §4.J.1, not rewritten. So the steady state rebuilds exactly
+// the page the last step appended into -- not an O(context) pass, which is what
+// §6.5 exists to forbid. That licence is exactly as wide as the append-only
+// assumption it rests on, and the decreasing-n_kv branch below is what happens
+// when the assumption stops holding.
+//
+// What this function returns is therefore a FREEZE WATERMARK, not a launch
+// origin. The builder is launched over every page and skips the frozen ones
+// itself, because §4.O's sentinel can only ever be written BELOW this value and
+// has to be reachable in the same launch (ADR-0024, CLEARING).
+//
+// PLACEMENT IS A KNOWN SMELL: file-static, so it is shared across CUDA contexts
+// rather than owned by one. Correct for the single-device single-context case
+// this fork runs, and it must move into ggml_backend_cuda_context before any
+// multi-context use. Keyed by device pointer, so a freed-and-reallocated cache
+// at the same address would look "already built" -- acceptable only because the
+// KV cache outlives every graph that reads it.
+// llama_kv_cache::get_n_kv() pads to this granularity; see the note below.
+
+    static std::mutex                             mtx;
+    static std::unordered_map<const void *, int>  seen;   // bounds ptr -> n_kv at last build
+
+    std::lock_guard<std::mutex> lock(mtx);
+
+    auto it = seen.find(bounds_data);
+    const int prev_n_kv = it == seen.end() ? 0 : it->second;
+    seen[bounds_data] = n_kv;
+
+    // The page holding the PREVIOUS tail may have been partial, so it is the
+    // first page that still needs work. Everything below it is frozen.
+    //
+    // *** n_kv IS PADDED, SO IT IS NOT A CONTENT WATERMARK. ***
+    // llama_kv_cache::get_n_kv() returns GGML_PAD(used_max_p1, 256), so during
+    // decode it is CONSTANT for 256 steps and then jumps by 256. Keying the
+    // watermark on it directly made page_first == n_pages while it was
+    // unchanged, so page_last >= page_first was false and NOTHING was rebuilt
+    // for 255 steps out of every 256 -- new keys ranked against records built
+    // before they existed. Measured 2026-08-06 at Kne1 23040 -> 23296:
+    // five build=1 lines at the crossing, then five build=0, repeating
+    //
+    // The direction is the unsafe one: a record that does not cover the newest
+    // keys UNDER-states the page's bound, so the page ranks too low and can be
+    // dropped -- §4.D violated, silently, which is exactly the failure the
+    // retrieval gate cannot see. This is the same defect class the window
+    // computation already carries a warning about at the head of
+    // position is required.
+    //
+    // The true content length is not host-visible here (the selector reads
+    // pos_q out of the mask for precisely this reason), so the fix is
+    // conservative rather than exact: back the watermark off by the maximum
+    // padding, which is the 256 GGML_PAD granularity. That rebuilds at most
+    // ceil(256/page_size) extra pages per step and can never leave the tail
+    // stale. Over-rebuilding costs bandwidth; under-rebuilding drops content.
+    //
+    // *** AND n_kv CAN FALL, WHICH THE BACK-OFF ABOVE DOES NOT COVER. ***
+    // about an APPEND-ONLY cache, where prev_n_kv is a floor. It is not one:
+    // llama_kv_cache::clear(), a seq_rm deep enough to cross a padding
+    // boundary, a prompt-cache checkpoint restore and a context shift all
+    // shrink the cache. When that happens page_first is derived from the OLD,
+    // larger prev_n_kv, so page_first > page_last = n_pages - 1, nothing below
+    // the watermark is rebuilt, and NOTHING is rebuilt at all -- for as long as
+    // the cache stays short. New content is then ranked against records
+    // accumulated over content that is gone: §4.D violated, silently, in the
+    // same unsafe direction as the padding defect.
+    //
+    // A CLAMP IS NOT THE FIX, and this is the whole design decision. Taking
+    // min(prev_n_kv, n_kv) is O(1) and wrong: it freezes every page BELOW the
+    // new tail, and a decrease is precisely the event that can have rewritten
+    // those rows. build_rope_shift rewrites every cached key in place (§7.J);
+    // a seq_rm plus refill lands new keys in freed cells low in the cache
+    // (§7.W). The rows a clamp keeps frozen are the rows most likely to be
+    // stale. So: any decrease is answered with page_first = 0 -- ONE full
+    // rebuild -- which is what §7.X's Recovery clause already rules.
+    //
+    // WHY §6.5 DOES NOT FORBID THAT, argued rather than asserted, because the
+    // next person to touch this function is the one who has to weigh it.
+    // §6.5 forbids an O(context) scan ON THE STEADY-STATE PATH. The
+    // steady-state path is decode-by-append, and it is monotone: an append
+    // cannot lower n_kv, so it cannot reach this branch. Reaching it requires
+    // a MUTATION event -- clear, checkpoint restore, context shift, a deep
+    // seq_rm -- which is not a step of the steady state but an interruption of
+    // it. Two things make that argument load-bearing rather than a definition:
+    //   (1) the watermark is still advanced -- the unconditional
+    //       `seen[bounds_data] = n_kv` above runs on this path too -- so the
+    //       pass is paid ONCE per event and the very next step is tail-only
+    //       again. Move that store under an `n_kv >= prev_n_kv` and the full
+    //       rebuild WOULD become the steady state, and §6.5 would forbid it
+    //       correctly. That is why it is asserted separately in §10's test.
+    //   (2) the cost is bounded by a pass this design already pays: rebuilding
+    //       whose cost §8 already carries. A mutation event is charged one
+    //       extra prefill-shaped bounds pass, not a new order of work.
+    // It is LOGGED for the same reason §7.X's Recovery makes logging
+    // non-optional: if some caller shrinks the cache every step, this branch
+    // plus a scan with nothing announcing it (crosscut.bench-integrity,
+    // perf.gates-that-lie). A visible line is what makes that a bug report
+    // instead of a slow mystery.
+    if (n_kv < prev_n_kv) {
+                      "if this repeats every step, that is the bug)\n",
+                      __func__, (size_t) bounds_data, prev_n_kv, n_kv,
+                      (n_kv + page_size - 1) / page_size);
+        return 0;
+    }
+
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    // arms the producer block below; exactly one of nine launch_fattn call sites passes it
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1088,6 +1582,231 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    // §2.5): both fill `KV_max` with a per-launch skip structure, and exactly
+    // one of them may own it. They are mutually exclusive rather than merged
+    // because the mask scan only runs for prefill-shaped launches
+    // launch wants both -- and a silent merge would be the kind of confounded
+    // path that cannot be reasoned about later.
+        const int n_head   = Q->ne[2];
+        const int nseq     = Q->ne[3];
+
+        //
+        // Tail-page-only in the steady state (§6.5). The arithmetic here is the
+        // than recomputed at the call site.
+        //
+        // §4.O CLEARING: page_first is a FREEZE WATERMARK, not the launch
+        // origin. The launch covers every page, and the kernel early-outs on a
+        // frozen page UNLESS its record carries the invalidation sentinel. It
+        // has to be that way round: an invalidated page is by definition below
+        // the watermark (a write at or above it is in a page this rebuilds
+        // anyway), so a launch that started at page_first could never reach one
+        // -- the sentinel would be honoured forever, every invalidated page
+        // would attend for the rest of the session, and §8's arithmetic would
+        // decay with session churn with nothing announcing it
+        // (crosscut.bench-integrity, perf.gates-that-lie). Clearing happens in
+        // THIS launch, on the same stream, ahead of the selector below, so not
+        // even one selection runs against a sentinel that a rebuild has already
+        // been asked for.
+        ggml_tensor * bounds    = dst->src[5];
+        GGML_ASSERT(page_size > 0);
+
+        const int n_pages    = (K->ne[1] + page_size - 1) / page_size;
+        const int page_last  = n_pages - 1;
+
+
+        // Capacity is n_blocks: the union of ANY page selection over blocks can
+        // never exceed the block count of the whole view (§7's fail toward
+        // attending applied to granularity).
+
+        KV_max.alloc(lay.total);
+
+        ggml_cuda_kernel_launch_params launch_params =
+        // §3.5 step 3 -- the resident set, via the ONE implementation of the
+        //
+        // THE INVARIANT: the window must cover at least W REAL tokens --
+        //
+        //
+        // and the sink must cover at least n_sink real tokens. Both roundings
+        // are outward, TOWARD residency (ceil for the sink, floor for the
+        // window), so a partially covered page is resident rather than ranked.
+        //
+        // *** THE WINDOW START IS NOT COMPUTED HERE, AND MUST NOT BE. ***
+        // It needs pos_q, the query's OWN position, which is not a host-visible
+        // quantity: K->ne[1] is GGML_PAD(n_tokens, 256) and runs up to 255 cells
+        // past the last real token. Feeding that padded length in as pos_q is a
+        // shipped defect this comment used to assert was safe ("a superset --
+        // fail toward attending"). It is the exact opposite: first_window_page
+        // is monotonically INCREASING in pos_q and the window is the page range
+        // [first_window_page, n_pages), so an over-estimate RAISES the start and
+        // DROPS real tokens off the back of the window -- 941 covered against a
+        // declared 1024 at the operating point, which is a silent retrieval
+        // miss. The selector reads the true pos_q out of the mask instead.
+        //
+        // n_sink_pages has no such hazard: ceil(n_sink/B) is a function of the
+        // hparams knobs alone and touches neither pos_q nor n_kv, so it stays
+        // on the host. It is computed through the same shared header so the two
+        // halves of §3.5 cannot drift apart independently.
+
+
+        // §2.3/§4.N have already restricted this launch to a single sequence and
+        // row is row 0 of sequence 0 and needs no stride arithmetic. Assert it
+        // rather than assume it: a future relaxation of those guards would
+        // otherwise read a wrong row and mis-place the window silently.
+        GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
+
+
+        } else {
+            const ggml_tensor * Qt = dst->src[0];
+            float scale = 1.0f;
+            memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+            // smem: n_pages floats for U_p, plus 64 floats of reduction scratch
+            const size_t smem = (n_pages + 64)*sizeof(float);
+
+            ggml_cuda_kernel_launch_params lp_sel =
+                lay.n_lists, lay.stride, lay.list_off,
+                n_pages, (int) bounds->ne[1], (int) K->ne[1], (int) K->ne[0], (int) K->ne[2],
+                n_head, Qt->nb[1], Qt->nb[2], scale);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        if (drop_one) {
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Read the produced buffer BACK and report on it. Two consumers, ONE
+        // readback:
+        //
+        //     even though the branch demonstrably runs, so the question "did the
+        //     drop land in the buffer the kernel reads?" has to be answered by
+        //     observation, not by reading the producer source again.
+        //     traffic counters. The knob is parsed and range-checked by
+        //     llama_hparams (src/llama-hparams.cpp, §6.7); the backend cannot
+        //     reach hparams, so it reads the same variable rather than growing a
+        //     already rejected anything outside [0,1].
+        //
+        // Both are off by default and cost nothing when off (§4.S). When ON,
+        // is a diagnostic, NOT a timing measurement, and its tok/s must not be
+        // quoted as one.
+
+        static bool       dbg_list_done = false;
+
+            const bool want_list     = dbg_list && !dbg_list_done;
+
+            // A readback needs a stream synchronize, and a synchronize is
+            // ILLEGAL while the stream is capturing a CUDA graph -- it aborts
+            // the process ("operation not permitted when stream is capturing").
+            // is_enabled, common.cuh); this check is the belt to that braces,
+            // and it REPORTS the skip rather than swallowing it, because a
+            // statistics stream with silent holes is worse than none.
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            if (want_readback) {
+                CUDA_CHECK(cudaStreamIsCapturing(main_stream, &capture));
+            }
+
+            if (want_readback && capture != cudaStreamCaptureStatusNone) {
+                    fprintf(stderr,
+                        "(the counters need a readback; run with GGML_CUDA_DISABLE_GRAPHS=1)\n",
+                        bounds->name);
+                    fflush(stderr);
+                }
+            } else if (want_readback) {
+                std::vector<int> h(lay.total);
+                CUDA_CHECK(cudaMemcpyAsync(h.data(), KV_max.ptr, lay.total*sizeof(int),
+                                           cudaMemcpyDeviceToHost, main_stream));
+                CUDA_CHECK(cudaStreamSynchronize(main_stream));
+
+                    // §4.K/§4.S — metadata bytes and KV bytes, SEPARATELY. The
+                    // header before changing anything here, in particular why
+                    // the two figures are never summed.
+                    cfg.n_pages      = n_pages;
+                    cfg.n_sink_pages = n_sink_pages;
+                    // The host cannot see pos_q (that is the whole point of the
+                    // §3.5 fix above), so it bounds it by the padded length. The
+                    // window start is monotone in pos_q, so this OVER-states the
+                    // ranked range -- the metadata leg errs toward "the scan is
+                    // expensive", which is the direction that cannot hide a
+                    // metadata-dominated regime.
+                    cfg.first_window_page =
+                    cfg.n_kv_head      = (int) K->ne[2];
+                    cfg.record_bytes   = bounds->nb[1];   // the §6.3 record, from the tensor itself
+                    cfg.n_lists        = lay.n_lists;
+                    cfg.list_stride    = lay.stride;
+                    cfg.list_off       = lay.list_off;
+                    cfg.n_head         = n_head;
+                    // What the kernel LOADS per token per KV HEAD: one head-dim
+                    // row of K plus one of V, in the type it actually reads
+                    // (f16 if this launch converted the cache).
+                    //
+                    // NOT nb11/nb21. Those are the TOKEN strides, and the KV
+                    // cache interleaves all four KV heads within a token, so
+                    // nb11 is 4x the row this kernel reads (576 B vs 144 B at
+                    // q4_0, head_dim 256). Using it inflated kv_bytes by the GQA
+                    // KV-head count -- caught by the first real decode, because
+                    // the counter's own arithmetic disagreed with §8.2.
+                    const size_t k_row = (need_f16_K && K->type != GGML_TYPE_F16)
+                        ? K->ne[0]*sizeof(half) : ggml_row_size(K->type, K->ne[0]);
+                    const size_t v_row = (need_f16_V && V->type != GGML_TYPE_F16)
+                        ? V->ne[0]*sizeof(half) : ggml_row_size(V->type, V->ne[0]);
+                    cfg.kv_row_bytes   = k_row + v_row;
+
+
+                    char line[512];
+                    fprintf(stderr, "%s\n", line);
+                    fflush(stderr);
+                }
+
+                if (want_list) {
+                    dbg_list_done = true;
+                    // n_pages vs bounds_pages is PROOF OF EXECUTION for the §6.3
+                    // record-stride fix, and it is printed rather than derived
+                    // because deriving it is exactly what hid the defect: the
+                    // selector used n_pages as the per-kv_head record stride
+                    // while the builder used bounds->ne[1], and the two are
+                    // equal only when the cache is exactly full. Any line where
+                    // these two differ is a step on which the old code read
+                    // another KV head's bound records.
+                    fprintf(stderr,
+                        "hdr[C]=%d hdr[O]=%d n_iter[0]=%d n_pages=%d bounds_pages=%d\n",
+                        h[0], h[1], n0, n_pages, (int) bounds->ne[1]);
+                    const int mid = n0/2;
+                    for (int t = (mid-2 < 0 ? 0 : mid-2); t <= mid+2 && t < lay.stride; ++t) {
+                        fprintf(stderr, " %d", h[lay.list_off + 0*lay.stride + t]);
+                    }
+                    fprintf(stderr, "   (drop_one=%d)\n", (int) drop_one);
+
+                    // PROOF OF EXECUTION for the §3.5 window fix, read out of the
+                    // buffer the kernel actually produced rather than inferred from
+                    // the source. The resident window is the CONTIGUOUS ASCENDING
+                    // TAIL of the list (D4 emits in page order), so walking that run
+                    // back from the end recovers the window start the DEVICE chose.
+                    // Its distance to the last real token is the real-token coverage
+                    // the invariant is about: it must be >= the declared W, and the
+                    // padded-pos_q defect showed up here as a coverage BELOW W.
+                    {
+                        const int * L = h.data() + lay.list_off;
+                        int run = n0 - 1;
+                        const int win_start_tok = n0 > 0 ? L[run] : -1;
+                        // The coverage printed is measured against the PADDED view,
+                        // because pos_q is the one quantity the host cannot see --
+                        // which is the whole reason for this fix. It is therefore an
+                        // UPPER BOUND on the real-token coverage, and it is labelled
+                        // so: under the padded-pos_q defect this line would have
+                        // printed exactly W and looked perfect while the real
+                        // coverage was W - 83. Compare `window starts at token`
+                        // against first_window_page*page_size instead; that is the
+                        // number the device actually chose.
+                        fprintf(stderr,
+                            "device window starts at token %d (page %d) -> <=%d padded cells "
+                            "covered, an UPPER BOUND on real coverage (declared W=%d)\n",
+                            win_start_tok, win_start_tok < 0 ? -1 : win_start_tok/page_size,
+                            win_start_tok < 0 ? -1 : (int) K->ne[1] - win_start_tok,
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+    } else
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.

@@ -169,15 +169,40 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 #elif defined(DATA_A_Q2_0)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
-            const uint ib = idx / 16;
-            const uint iqs = idx & 0xfu;
+            const uint ib = idx / 8;           // 8 values per idx, 64 per block
+            const uint iqs = (idx & 0x7u) * 2; // byte pair
 
-            const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
-            const uint bits = uint(data_a[ib].qs[iqs]);
+            const float d = float(data_a[ib].d);
+            const uint q0 = uint(data_a[ib].qs[iqs]);
+            const uint q1 = uint(data_a[ib].qs[iqs + 1]);
+
+            // 2-bit codes {0,1,2,3} map to {-1,0,+1,+2}
+            const uint k_pair = row * LOAD_VEC_A / 2;
+            store_a(col, k_pair,     FLOAT_TYPEV2(d * (int( q0        & 3u) - 1), d * (int((q0 >> 2u) & 3u) - 1)));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(d * (int((q0 >> 4u) & 3u) - 1), d * (int( q0 >> 6u      ) - 1)));
+            store_a(col, k_pair + 2, FLOAT_TYPEV2(d * (int( q1        & 3u) - 1), d * (int((q1 >> 2u) & 3u) - 1)));
+            store_a(col, k_pair + 3, FLOAT_TYPEV2(d * (int((q1 >> 4u) & 3u) - 1), d * (int( q1 >> 6u      ) - 1)));
+#elif defined(DATA_A_Q2_B3)
+            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
+
+            const uint ib = idx / 32;           // 4 values per idx, 128 per block
+            const uint iqs = (idx % 32) * 4;    // first trit
+
+            const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+            const float d = float(data_a[ib].d0);
+            vec4 v;
+            [[unroll]] for (uint t = 0; t < 4; ++t) {
+                const uint j = iqs + t;
+                // v2 chunk-aligned layout: chunk c bytes [6c..6c+5] + straggler 24+(c>>1)
+                const uint c = j >> 5, tt = j & 31u;
+                const uint byte_i = tt < 30u ? 6u*c + tt/5u : 24u + (c >> 1u);
+                const uint digit  = tt < 30u ? tt % 5u : 2u*(c & 1u) + (tt - 30u);
+                v[t] = d * float(int((uint(data_a[ib].qs[byte_i]) / pw3[digit]) % 3u) - 1);
+            }
 
             const uint k_pair = row * LOAD_VEC_A / 2;
-            store_a(col, k_pair,     d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f)));
-            store_a(col, k_pair + 1, d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f)));
+            store_a(col, k_pair,     FLOAT_TYPEV2(v.xy));
+            store_a(col, k_pair + 1, FLOAT_TYPEV2(v.zw));
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 

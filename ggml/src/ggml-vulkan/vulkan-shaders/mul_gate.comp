@@ -1,0 +1,40 @@
+#version 450
+
+// Fused UNARY(gate)+MUL: dst = a * gate_fn(b), where b is the unary node's
+// input and a is the mul's other operand. GATE_OP selects the gate function
+// at shader-compile time (op_sigmoid / op_silu). Indexing and broadcast
+// semantics are identical to mul.comp (generic binary).
+
+#include "types.glsl"
+#include "generic_binary_head.glsl"
+
+const uint num_threads = 256;
+
+layout(local_size_x = num_threads, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE op_sigmoid(FLOAT_TYPE x) {
+    return FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + FLOAT_TYPE(exp(-float(x))));
+}
+
+FLOAT_TYPE op_silu(FLOAT_TYPE x) {
+    return x / (FLOAT_TYPE(1.0) + FLOAT_TYPE(exp(-float(x))));
+}
+
+void main() {
+    uint idx = get_idx();
+
+    // num_threads * num_iter must equal 512, to match the wg_denoms and get_idx calculation
+    const uint num_iter = 2;
+
+    [[unroll]] for (uint i = 0; i < num_iter; ++i) {
+        if (idx >= p.ne) {
+            continue;
+        }
+        uint i00, i01, i02, i03;
+        get_indices(idx, i00, i01, i02, i03);
+
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * GATE_OP(FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)])));
+
+        idx += num_threads;
+    }
+}

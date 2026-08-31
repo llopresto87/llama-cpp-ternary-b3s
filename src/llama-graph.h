@@ -155,6 +155,21 @@ public:
     const int64_t n_embd = 0;
 };
 
+// DSpark GIDD log-SNR conditioning: the sinusoidal feature matrix fed into
+// log_snr_fc1/fc2. The per-position pattern (block anchors at max_log_snr,
+// masked draft positions at min_log_snr) is a pure function of quantities known
+// at graph-build time, so the builder precomputes the [n_freq, n_draft] matrix
+// and this input just stages it (no_alloc graphs route all data through
+// set_input()).
+public:
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * feat = nullptr; // F32 [n_freq, n_draft]
+
+    std::vector<float> v_feat;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -1172,7 +1187,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // src[5]. nullptr is the universal case and changes nothing.
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

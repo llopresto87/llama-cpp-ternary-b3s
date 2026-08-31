@@ -176,6 +176,98 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Ternary q2_b3: 128 weights per block, ONE f16 scale, base-3 v2 chunk-aligned
+// packing decoded via ggml_cuda_b3lut. Decode to SIGNED int8 (trit-1) into a
+// q8_0-format tile so q8_0's vec_dot applies directly with no s-term.
+// The single scale is broadcast to all four 32-weight sub-blocks.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_b3(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK2_B3;                       // 2
+    constexpr int threads_per_row = blocks_per_iter * QI2_B3;                  // 8
+    constexpr int nrows = warp_size / threads_per_row;
+    constexpr int scale_entries_per_block = QK2_B3 / QK8_1;                    // 4
+    constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block; // 8
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / QI2_B3;  // 0..1 : which 128-weight block
+    const int kqsx = txi % QI2_B3;  // 0..3 : which 32-weight chunk within the block
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_b3 * bxi = (const block_q2_b3 *) x + kbx0 + i*stride + kbx;
+        const uint8_t * qs = bxi->qs;
+
+        int unpacked_bytes[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {           // 8 groups (ints) of 4 elements
+            int packed = 0;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int elem  = kqsx*32 + j*4 + l;   // element within the 128-weight block
+                const int c     = elem >> 5;
+                const int t     = elem & 31;
+                const int byte  = (t < 30) ? (6*c + t/5) : (24 + (c >> 1));
+                const int digit = (t < 30) ? (t % 5)     : (2*(c & 1) + (t - 30));
+                const int trit  = (ggml_cuda_b3lut[qs[byte]] >> (2*digit)) & 0x3;
+                const int s     = trit - 1;
+                packed |= (s & 0xFF) << (8*l);
+            }
+            unpacked_bytes[j] = packed;
+        }
+
+        const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+            x_qs[i*sram_stride           + dst_offset + j] = unpacked_bytes[j];
+#else
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + j] = unpacked_bytes[j];
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        }
+    }
+
+    const int ksx = threadIdx.x % scale_entries_per_row;
+    const int scale_block = ksx / scale_entries_per_block;   // 0..1 : which 128-weight block
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q2_b3 * bxi = (const block_q2_b3 *) x + kbx0 + i*stride + scale_block;
+        const ggml_half d = bxi->d;   // single scale, broadcast to all 4 sub-blocks
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                           + ksx] = d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

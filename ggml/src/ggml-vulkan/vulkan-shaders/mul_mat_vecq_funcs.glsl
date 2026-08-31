@@ -4,11 +4,7 @@
 
 #include "types.glsl"
 
-#if defined(DATA_A_Q2_0)
-FLOAT_TYPE get_dm(uint ib) {
-    return FLOAT_TYPE(data_a[ib / 2].d);
-}
-#elif defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib].d);
 }
@@ -26,6 +22,78 @@ FLOAT_TYPE get_dm(uint ib) {
 }
 #endif
 
+#if defined(DATA_A_Q2_B3)
+// base-3 packed ternary, 32 quants per call (one full Q8_1 block).
+// v2 chunk-aligned layout: chunk c owns whole bytes [6c..6c+5] (30 trits) plus
+// 2 straggler trits in byte 24+(c>>1) at digit 2*(c&1). Every byte is decoded
+// via the shared b3_lut (byte -> 5x2-bit crumbs) and the 32-crumb stream is
+// assembled into two u32s with COMPILE-TIME shifts only — no runtime-skip u64
+// chain (64-bit shifts are double-cost on RDNA3 and serialized the old path).
+// Dot uses the same unsigned-code + s-term trick as Q2_0: values are
+// (code - 1) * d with the offset folded into one s subtract.
+// TQ NOTE: an if-guarded memoize-last of the decode was tried here and was a
+// hard NEGATIVE at batch-1 (tg128 71.2 -> 54.3): the branch + intermediate
+// array defeated the compiler's decode/dot interleaving. The multi-column
+// decode amortization is done structurally instead: MMVQ_SPLIT_DOT below lets
+// mul_mat_vecq.comp invert its column/row loops for this type so the decode
+// hoists naturally out of the column loop (branch-free).
+#define MMVQ_SPLIT_DOT 1
+uint32_t b3_dec[8];
+float    b3_da;
+
+void mmvq_decode_block(const uint ib_a) {
+    const uint ib = ib_a / 4;          // 128-value block
+    const uint c  = ib_a & 3u;         // 32-value chunk
+
+    // 6 aligned bytes = 3 u16s at indices 3c..3c+2 (6c is always even);
+    // straggler byte pair (24,25) is u16 index 12.
+    const uint w0 = 3u * c;
+    const uint v01 = uint(data_a_packed16[ib].qs[w0     ]);
+    const uint v23 = uint(data_a_packed16[ib].qs[w0 + 1u]);
+    const uint v45 = uint(data_a_packed16[ib].qs[w0 + 2u]);
+    const uint vst = uint(data_a_packed16[ib].qs[12u]);
+
+    const uint L0 = b3_lut[v01 & 0xFFu];
+    const uint L1 = b3_lut[v01 >> 8u];
+    const uint L2 = b3_lut[v23 & 0xFFu];
+    const uint L3 = b3_lut[v23 >> 8u];
+    const uint L4 = b3_lut[v45 & 0xFFu];
+    const uint L5 = b3_lut[v45 >> 8u];
+    // straggler crumbs: digits 2*(c&1), 2*(c&1)+1 -> 4 bits at crumb offset 4*(c&1)
+    const uint S  = (b3_lut[(vst >> (8u * (c >> 1u))) & 0xFFu] >> (4u * (c & 1u))) & 0xFu;
+
+    // 64 crumb bits as two u32s, all shifts constant:
+    // lo: L0[10] L1[10] L2[10] L3[0:1]   hi: L3[2:9] L4[10] L5[10] S[4]
+    const uint lo32 = L0 | (L1 << 10) | (L2 << 20) | (L3 << 30);
+    const uint hi32 = (L3 >> 2u) | (L4 << 8) | (L5 << 18) | (S << 28);
+
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint bl = (lo32 >> (8u * k)) & 0xFFu;
+        uint32_t v0 = ((bl | (bl << 12)) & 0x000F000Fu);
+        b3_dec[k] = (v0 | (v0 << 6)) & 0x03030303u;
+
+        const uint bh = (hi32 >> (8u * k)) & 0xFFu;
+        uint32_t v1 = ((bh | (bh << 12)) & 0x000F000Fu);
+        b3_dec[k + 4] = (v1 | (v1 << 6)) & 0x03030303u;
+    }
+
+    b3_da = float(data_a_packed16[ib].d0);
+}
+
+FLOAT_TYPE mmvq_dot_cached() {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        q_sum += dotPacked4x8EXT(int32_t(b3_dec[k]), cache_b_qs[k]);
+    }
+    return FLOAT_TYPE(b3_da * (float(q_sum) * float(cache_b_ds.x) - float(cache_b_ds.y)));
+}
+
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    mmvq_decode_block(ib_a);
+    return mmvq_dot_cached();
+}
+#endif
+
 #if defined(DATA_A_Q2_K)
 FLOAT_TYPEV2 get_dm(uint ib) {
     const uint ib_k = ib / 8;
@@ -34,27 +102,6 @@ FLOAT_TYPEV2 get_dm(uint ib) {
 #endif
 
 // Each iqs value maps to a 32-bit integer
-#if defined(DATA_A_Q2_0)
-uint unpack_q2_0(uint bits) {
-    // Move bit pairs [1:0], [3:2], [5:4], [7:6] to [1:0], [9:8], [17:16], [25:24].
-    bits &= 0xffu;
-    bits = (bits | (bits << 12u)) & 0x000f000fu;
-    return (bits | (bits << 6u)) & 0x03030303u;
-}
-
-i32vec4 repack4(uint ib, uint iqs) {
-    const uint qs_idx = (ib & 1u) * 4u + iqs * 2u;
-    const uint bits = pack32(u16vec2(data_a_packed16[ib / 2].qs[qs_idx],
-                                     data_a_packed16[ib / 2].qs[qs_idx + 1]));
-    return i32vec4(unpack_q2_0(bits), unpack_q2_0(bits >> 8u),
-                   unpack_q2_0(bits >> 16u), unpack_q2_0(bits >> 24u));
-}
-
-FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const int32_t sum_divisor) {
-    return FLOAT_TYPE(da * (float(q_sum) * dsb.x - dsb.y / float(sum_divisor)));
-}
-#endif
-
 #if defined(DATA_A_Q4_0)
 // 2-byte loads for Q4_0 blocks (18 bytes)
 i32vec2 repack(uint ib, uint iqs) {
@@ -157,19 +204,7 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
-#if defined(DATA_A_Q2_0)
-FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
-    int32_t q_sum = 0;
-    const i32vec4 qs_a = repack4(ib_a, iqs);
-    q_sum += dotPacked4x8EXT(qs_a.x, cache_b_qs[0]);
-    q_sum += dotPacked4x8EXT(qs_a.y, cache_b_qs[1]);
-    q_sum += dotPacked4x8EXT(qs_a.z, cache_b_qs[2]);
-    q_sum += dotPacked4x8EXT(qs_a.w, cache_b_qs[3]);
-
-    // 16 quants per call => divide sums by 32/16 = 2
-    return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 2);
-}
-#elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+#if defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
 #if QUANT_R == 2
@@ -189,6 +224,35 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 
     // 2 quants per call => divide sums by 8/2 = 4
     return mul_q8_1(q_sum, get_dm(ib_a), cache_b_ds, 4);
+}
+#endif
+
+#if defined(DATA_A_Q2_0)
+// 2x8-byte loads for Q2_0 blocks (18 bytes). 32 quants per call: one full
+// Q8_1 block, so the ternary -1 offset folds into exactly one s subtraction
+// (single float fma per block - fewest roundings on this path).
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    // ib_a counts 32-value chunks; the Q2_0 block covers two of them
+    const uint ib = ib_a / 2;
+    const uint base = (ib_a & 1u) * 4u;
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q = uint(data_a_packed16[ib].qs[base + k]);
+
+        // Spread the four 2-bit codes of each byte (unsigned, 0..3) into the
+        // four int8 lanes of a dot word: c3c2c1c0 -> 0x0c30c20c10c0.
+        uint32_t v0 = ((q & 0xFFu) | ((q & 0xFFu) << 12)) & 0x000F000Fu;
+        v0 = (v0 | (v0 << 6)) & 0x03030303u;
+        uint32_t v1 = ((q >> 8u) | ((q >> 8u) << 12)) & 0x000F000Fu;
+        v1 = (v1 | (v1 << 6)) & 0x03030303u;
+
+        q_sum += dotPacked4x8EXT(int32_t(v0), cache_b_qs[2 * k    ]);
+        q_sum += dotPacked4x8EXT(int32_t(v1), cache_b_qs[2 * k + 1]);
+    }
+
+    const float da = float(data_a_packed16[ib].d);
+    return FLOAT_TYPE(da * (float(q_sum) * float(cache_b_ds.x) - float(cache_b_ds.y)));
 }
 #endif
 

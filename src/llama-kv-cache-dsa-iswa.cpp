@@ -50,7 +50,7 @@ llama_kv_cache_dsa_iswa::llama_kv_cache_dsa_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_dsa, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa = GGML_PAD(std::min(size_dsa, (hparams.n_swa + hparams.n_sink)*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -65,14 +65,14 @@ llama_kv_cache_dsa_iswa::llama_kv_cache_dsa_iswa(
     kv_dsa = std::make_unique<llama_kv_cache_dsa>(
             model, type_k, type_v,
             v_trans, offload, unified, size_dsa, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_dsa, filter_lid, reuse);
+            0, 0, LLAMA_SWA_TYPE_NONE, filter_dsa, filter_lid, reuse);
 
     LLAMA_LOG_INFO("%s: creating SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, nullptr, filter_swa, reuse, nullptr);
+            hparams.n_swa, hparams.n_sink, hparams.swa_type, nullptr, filter_swa, reuse, nullptr);
 }
 
 void llama_kv_cache_dsa_iswa::clear(bool data) {

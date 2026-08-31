@@ -17,6 +17,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   kv_size,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
+                 uint32_t   n_sink,
            llama_swa_type   swa_type,
                             /* recurrent */
                 ggml_type   type_r,
@@ -43,6 +44,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_seq_max,
         n_pad,
         n_swa,
+        n_sink,
         swa_type,
         nullptr,
         filter_attn == nullptr ?

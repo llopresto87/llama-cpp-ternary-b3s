@@ -436,6 +436,63 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void quantize_row_q2_b3_ref(const float * GGML_RESTRICT x, block_q2_b3 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_B3;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+        y[i].d = GGML_FP32_TO_FP16(amax);
+        const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
+
+        // base-3 pack, v2 chunk-aligned layout: 32-trit chunk c owns bytes
+        // [6c..6c+5] (5 trits each, 30) and 2 trits in straggler byte 24+(c>>1)
+        // at digit offset 2*(c&1). Constant per-chunk byte offsets let the GPU
+        // mmvq decode with compile-time shifts (no runtime-skip u64 chain).
+        static const uint8_t pw3[5] = { 1, 3, 9, 27, 81 };
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < qk; ++j) {
+            const float w = x[i*qk + j];
+            int q = (int)roundf(w * id) + 1;
+            if (q < 0) q = 0;
+            if (q > 2) q = 2;
+            const int c = j >> 5, t = j & 31;
+            const int byte  = t < 30 ? 6*c + t/5      : 24 + (c >> 1);
+            const int digit = t < 30 ? t % 5          : 2*(c & 1) + (t - 30);
+            y[i].qs[byte] = (uint8_t)(y[i].qs[byte] + q * pw3[digit]);
+        }
+    }
+}
+
+void dequantize_row_q2_b3(const block_q2_b3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_B3;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk; ++j) {
+            static const uint16_t pw3[5] = { 1, 3, 9, 27, 81 };
+            // v2 chunk-aligned layout (see quantize_row_q2_b3_ref)
+            const int c = j >> 5, t = j & 31;
+            const int byte_i = t < 30 ? 6*c + t/5 : 24 + (c >> 1);
+            const int digit  = t < 30 ? t % 5     : 2*(c & 1) + (t - 30);
+            const int q = (x[i].qs[byte_i] / pw3[digit]) % 3;
+            y[i*qk + j] = (q - 1) * d;
+        }
+    }
+}
+
 void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK2_0;
 
@@ -2119,6 +2176,21 @@ size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q2_0_ref(src, (block_q2_0*)qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q2_b3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    if (!quant_weights) {
+        quantize_row_q2_b3_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q2_B3, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_Q2_B3, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q2_b3_ref(src, (block_q2_b3*)qrow, n_per_row);
         src += n_per_row;
         qrow += row_size;
     }
@@ -5536,6 +5608,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q2_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_0, data, nb);
+            } break;
+        case GGML_TYPE_Q2_B3:
+            {
+                const block_q2_b3 * q = (const block_q2_b3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d, i)) {
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {

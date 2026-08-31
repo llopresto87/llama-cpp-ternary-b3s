@@ -70,7 +70,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    // note: the n_sink attention-sink cells at pos < n_sink are never masked, so the prune
+    //       scan never frees them. They are permanently occupied and have to be reserved on
+    //       top of the window rather than borrowed from it. At n_sink == 0 - every arch
+    //       that does not use sinks - this is the same expression it always was.
+    uint32_t size_swa = GGML_PAD(std::min(size_base, (hparams.n_swa + hparams.n_sink)*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -95,14 +99,14 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            0, 0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+            hparams.n_swa, hparams.n_sink, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

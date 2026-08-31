@@ -82,7 +82,10 @@ uint32_t backend_device_supports_op(apir_encoder * enc, apir_decoder * dec, virg
 
     const ggml_tensor * op = apir_decode_ggml_tensor_inplace(dec);
 
-    bool supports_op = dev->iface.supports_op(dev, op);
+    // through the public entry point, not dev->iface directly: that is where the
+    // fail-closed FLASH_ATTN_EXT src[5] guard lives, and a remoted device must
+    // answer the guest the same way a local one would.
+    bool supports_op = ggml_backend_dev_supports_op(dev, op);
 
     apir_encode_bool_t(enc, &supports_op);
 

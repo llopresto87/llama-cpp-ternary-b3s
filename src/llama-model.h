@@ -669,12 +669,7 @@ struct llama_model {
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
-    // dspark
-    struct ggml_tensor * dspark_markov_w1   = nullptr;
-    struct ggml_tensor * dspark_markov_w2   = nullptr;
-    struct ggml_tensor * dspark_markov_w2_s = nullptr;
-    struct ggml_tensor * dspark_conf_proj   = nullptr;
-    struct ggml_tensor * dspark_conf_proj_b = nullptr;
+    // GIDD log-SNR conditioning MLP (present only in SNR-conditioned DSpark drafters)
 
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;

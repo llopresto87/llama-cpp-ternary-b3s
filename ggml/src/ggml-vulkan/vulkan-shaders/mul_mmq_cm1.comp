@@ -1,0 +1,203 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout(binding = 1) readonly buffer B { block_q8_1_x4_packed128 data_b[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+layout(push_constant) uniform parameter {
+    uint M;
+    uint N;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+    uint base_work_group_z;
+    uint num_batches;
+    uint k_split;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint BM = 64;
+layout(constant_id = 2) const uint BN = 64;
+layout(constant_id = 3) const uint BK_UNUSED = 32;
+layout(constant_id = 4) const uint WM_UNUSED = 16;
+layout(constant_id = 5) const uint WN_UNUSED = 16;
+layout(constant_id = 6) const uint WMITER_UNUSED = 1;
+layout(constant_id = 7) const uint TM_UNUSED = 16;
+layout(constant_id = 8) const uint TN_UNUSED = 16;
+layout(constant_id = 9) const uint TK_UNUSED = 16;
+layout(constant_id = 10) const uint WARP = 64;
+
+// gfx1100 exposes 16x16x16 signed-int8 WMMA at subgroup scope. Force its
+// native wave32 mode: four 32-lane waves in a 128-thread workgroup cover the
+// four 16-row strips of this 64x64 tile without the wave64 fragment-lane
+// replication. Padding avoids LDS bank aliasing when cooperative-matrix loads
+// walk consecutive rows.
+const uint BK = 32;
+const uint K_STEPS = 1;
+const uint TILE_K = BK * K_STEPS;
+const uint CM = 16;
+const uint SHMEM_STRIDE = TILE_K + 4;
+const uint NUM_WARPS = BLOCK_SIZE / WARP;
+const uint COL_TILES = BN / CM;
+const uint ELEMS_PER_LANE = CM * CM / WARP;
+
+shared int8_t a_tile[BM * SHMEM_STRIDE];
+shared int8_t b_tile[BN * SHMEM_STRIDE];
+shared float a_scale[K_STEPS * BM];
+shared float b_scale[K_STEPS * BN];
+shared int32_t cm_stage[NUM_WARPS * CM * CM];
+
+void main() {
+    const uint lid = gl_LocalInvocationID.x;
+    const uint lane = lid % WARP;
+    const uint wave = lid / WARP;
+    const uint ir = gl_WorkGroupID.x;
+    const uint ic = gl_WorkGroupID.y;
+    const uint ik = gl_WorkGroupID.z / p.num_batches;
+    const uint batch_idx = gl_WorkGroupID.z % p.num_batches;
+
+    const uint i13 = batch_idx / p.ne12;
+    const uint i12 = batch_idx % p.ne12;
+    const uint i03 = i13 / p.broadcast3;
+    const uint i02 = i12 / p.broadcast2;
+    const uint batch_idx_a = i03 * p.ne02 + i02;
+
+    const uint start_k = ik * p.k_split;
+    const uint end_k = min(p.K, (ik + 1) * p.k_split);
+
+    float sums[COL_TILES * ELEMS_PER_LANE];
+    [[unroll]] for (uint i = 0; i < COL_TILES * ELEMS_PER_LANE; ++i) {
+        sums[i] = 0.0f;
+    }
+
+    for (uint block = start_k; block < end_k; block += TILE_K) {
+        for (uint linear = lid; linear < BM * TILE_K; linear += BLOCK_SIZE) {
+            const uint row = linear / TILE_K;
+            const uint kk = linear % TILE_K;
+            const uint step = kk / BK;
+            const uint k = kk % BK;
+            const uint gr = ir * BM + row;
+            const uint gk = block + kk;
+            int code = 0;
+            float scale = 0.0f;
+
+            if (gr < p.M && gk < end_k) {
+                const uint elem = batch_idx_a * p.batch_stride_a + gr * p.stride_a + gk;
+#if defined(DATA_A_Q2_0)
+                const uint ib = elem / QUANT_K_Q2_0;
+                const uint iq = elem % QUANT_K_Q2_0;
+                const uint packed = uint(data_a[ib].qs[iq / 4]);
+                code = int((packed >> (2 * (iq % 4))) & 3u) - 1;
+                scale = float(data_a[ib].d);
+#elif defined(DATA_A_Q2_B3)
+                const uint ib = elem / QUANT_K_Q2_B3;
+                const uint iq = elem % QUANT_K_Q2_B3;
+                const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+                code = int((uint(data_a[ib].qs[iq / 5]) / pw3[iq % 5]) % 3u) - 1;
+                scale = float(data_a[ib].d0);
+#endif
+            }
+            a_tile[row * SHMEM_STRIDE + kk] = int8_t(code);
+            if (k == 0) {
+                a_scale[step * BM + row] = scale;
+            }
+        }
+
+        for (uint linear = lid; linear < BN * TILE_K; linear += BLOCK_SIZE) {
+            const uint col = linear / TILE_K;
+            const uint kk = linear % TILE_K;
+            const uint step = kk / BK;
+            const uint k = kk % BK;
+            const uint gc = ic * BN + col;
+            const uint gk = block + kk;
+            int code = 0;
+            float scale = 0.0f;
+
+            if (gc < p.N && gk < end_k) {
+                const uint ib = (batch_idx * p.batch_stride_b + gc * p.stride_b + block + step * BK) / BK;
+                const uint ib_outer = ib / 4;
+                const uint ib_inner = ib % 4;
+                const ivec4 packed4 = data_b[ib_outer].qs[ib_inner * 2 + k / 16];
+                const int packed = packed4[(k % 16) / 4];
+                code = int(int8_t(packed >> (8 * (k % 4))));
+                scale = float(data_b[ib_outer].ds[ib_inner].x);
+            }
+            b_tile[col * SHMEM_STRIDE + kk] = int8_t(code);
+            if (k == 0) {
+                b_scale[step * BN + col] = scale;
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint step = 0; step < K_STEPS; ++step) {
+            const uint kbase = step * BK;
+            coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> ma0;
+            coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA> ma1;
+            coopMatLoad(ma0, a_tile, (wave * CM) * SHMEM_STRIDE + kbase,      SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(ma1, a_tile, (wave * CM) * SHMEM_STRIDE + kbase + CM, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+
+            [[unroll]] for (uint ct = 0; ct < COL_TILES; ++ct) {
+                coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> mb0;
+                coopmat<int8_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB> mb1;
+                coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator> acc;
+                coopMatLoad(mb0, b_tile, (ct * CM) * SHMEM_STRIDE + kbase,      SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(mb1, b_tile, (ct * CM) * SHMEM_STRIDE + kbase + CM, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopmat<int32_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>(0);
+                acc = coopMatMulAdd(ma0, mb0, acc);
+                acc = coopMatMulAdd(ma1, mb1, acc);
+                coopMatStore(acc, cm_stage, wave * CM * CM, CM, gl_CooperativeMatrixLayoutColumnMajor);
+                memoryBarrierShared();
+
+                // All lanes in the gfx1100 wave execute the store/fence/load in
+                // lockstep, so a memory fence is sufficient here; a subgroup
+                // execution barrier serialized every 32-value scale block.
+                [[unroll]] for (uint j = 0; j < ELEMS_PER_LANE; ++j) {
+                    const uint e = lane + j * WARP;
+                    const uint rr = e % CM;
+                    const uint cc = e / CM;
+                    sums[ct * ELEMS_PER_LANE + j] += float(cm_stage[wave * CM * CM + e]) *
+                                         a_scale[step * BM + wave * CM + rr] *
+                                         b_scale[step * BN + ct * CM + cc];
+                }
+                memoryBarrierShared();
+            }
+        }
+
+        barrier();
+    }
+
+    const uint offsets = batch_idx * p.batch_stride_d + ik * p.batch_stride_d * p.num_batches;
+    [[unroll]] for (uint ct = 0; ct < COL_TILES; ++ct) {
+        [[unroll]] for (uint j = 0; j < ELEMS_PER_LANE; ++j) {
+            const uint e = lane + j * WARP;
+            const uint rr = e % CM;
+            const uint cc = e / CM;
+            const uint gr = ir * BM + wave * CM + rr;
+            const uint gc = ic * BN + ct * CM + cc;
+            if (gr < p.M && gc < p.N) {
+                data_d[offsets + gc * p.stride_d + gr] = sums[ct * ELEMS_PER_LANE + j];
+            }
+        }
+    }
+}

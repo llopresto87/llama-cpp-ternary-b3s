@@ -40,7 +40,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_idx) :
     llama_memory_hybrid(
         model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+        type_k, type_v, v_trans, kv_size, n_pad, n_swa, model.hparams.n_sink, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
@@ -54,7 +54,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            kv_size, n_seq_max, n_pad, n_swa, model.hparams.n_sink, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 

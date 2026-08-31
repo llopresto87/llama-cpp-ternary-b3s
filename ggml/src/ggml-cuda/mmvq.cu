@@ -12,6 +12,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
+        case GGML_TYPE_Q2_B3:   return vec_dot_q2_b3_q8_1;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
@@ -41,6 +42,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
         case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
+        case GGML_TYPE_Q2_B3:   return VDR_Q2_B3_Q8_1_MMVQ;
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
@@ -1093,6 +1095,700 @@ static void mul_mat_vec_q_switch_ncols_dst(
             break;
     }
 }
+// =====================================================================================
+// Bespoke RDNA3 (gfx1100) ternary decode GEMV for q2_0 / q2_b3.
+//
+// One wave (physical warp) computes exactly one output row for the decode case
+// (ncols_dst == 1, single channel/sample, no ids, no fusion). Lanes stride over the
+// row's weight blocks; a warp reduction sums the per-lane partials. The int8 dot uses
+// ggml_cuda_dp4a (V_DOT4_I32_IU8 / sudot4 on RDNA3). The ternary (c-1) offset is folded
+// as -sum(x) via the q8_1 s-term: acc += d * (d8 * sumi - s8).
+//
+// Decode math is byte-identical to vec_dot_q2_0_q8_1 / vec_dot_q2_b3_q8_1 in vecdotq.cuh;
+// only the parallelization (wave-per-row instead of the generic multi-warp block) differs.
+// Everything else falls through to the generic mmvq path unchanged.
+// =====================================================================================
+
+// nwaves independent warps per block, each computing a DIFFERENT output row
+// (row = blockIdx.x*nwaves + threadIdx.y). Larger workgroups pack more waves per
+// CU at the small-m per-layer shapes (weights are Infinity-Cache-resident there),
+// where 1-wave workgroups under-fill the machine / exhaust workgroup slots. No
+// cross-warp cooperation, so no shared memory or barrier is needed. The decode math
+// is unchanged and byte-identical to vec_dot_q2_0_q8_1 / vec_dot_q2_b3_q8_1.
+
+// Per-lane partial sums of one output row against NCOLS activation columns (the accumulators
+// are the caller's, already zeroed; the caller warp-reduces each one). Lanes stride over the
+// evaluate the x-row and the gate-row against the SAME already-resident q8_1 activations.
+template <int warp_size>
+static __device__ __forceinline__ float ternary_row_partial_q2_0(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y,
+        const int row, const int nblocks, const int stride_row_x, const int lane) {
+    const block_q2_0 * xrow = (const block_q2_0 *) vx + (size_t) row * stride_row_x;
+
+    // NOTE: q2_0 keeps BLOCK-granular lane striding, unlike q2_b3. Sub-block striding was
+    // measured on gfx1100 (tg128, Q2_g64): 66.54 -> 65.34 t/s, a regression. q2_0 runs
+    // nwaves=2 and its 64-weight block amortizes the `d` load over two sub-blocks, so the
+    // per-unit reload costs more than the residual imbalance saves. Per-type, like nwaves.
+    float acc = 0.0f;
+    for (int ib = lane; ib < nblocks; ib += warp_size) {
+        const block_q2_0 * bq = xrow + ib;
+        const float d = (float) bq->d;
+#pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {                              // two 32-wide sub-blocks
+            const block_q8_1 * bq8 = y + ib*2 + sub;                     // qk/QK8_1 == 2
+            const float d8 = __low2float(bq8->ds);
+            const float s8 = __high2float(bq8->ds);                      // d8 * sum(x_quant) = sum(x_real)
+            int sumi = 0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {                                // 8 code bytes = 32 2-bit codes
+                const uint8_t byte = bq->qs[sub*8 + j];
+                const int codes = ( byte        & 0x03)
+                                | ((int)((byte>>2)&0x03) << 8)
+                                | ((int)((byte>>4)&0x03) << 16)
+                                | ((int)((byte>>6)&0x03) << 24);
+                const int u = get_int_b4(bq8->qs, j);
+                sumi = ggml_cuda_dp4a(codes, u, sumi);
+            }
+            acc += d * (d8 * sumi - s8);
+        }
+    }
+    return acc;
+}
+
+template <int warp_size>
+static __device__ __forceinline__ float ternary_row_partial_q2_b3(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y,
+        const int row, const int nblocks, const int stride_row_x, const int lane) {
+    const block_q2_b3 * xrow = (const block_q2_b3 *) vx + (size_t) row * stride_row_x;
+
+    // Stride lanes over 32-weight CHUNKS, not whole 128-weight blocks. At the decode shapes
+    // that dominate this model (k=5120 => 40 blocks/row) block-granular striding leaves
+    // 40/32 = 1.25 blocks per lane, i.e. a 2x load imbalance across the wave with the warp
+    // reduction paid regardless. Chunk granularity gives 160/32 = exactly 5 units per lane.
+    const int nunits = nblocks * 4;
+    float acc = 0.0f;
+    for (int u = lane; u < nunits; u += warp_size) {
+        const int ib    = u >> 2;
+        const int chunk = u & 3;
+        const block_q2_b3 * bq = xrow + ib;
+        const uint8_t * qs = bq->qs;
+        {
+            const float d  = (float) bq->d;                              // one scale per 128
+            const block_q8_1 * bq8 = y + ib*4 + chunk;                   // qk/QK8_1 == 4
+            const float d8 = __low2float(bq8->ds);
+            const float s8 = __high2float(bq8->ds);
+
+            // Cheap base-3 unpack: one pre-expanded LUT load per dense byte gives four
+            // int8 code-lanes (bits 0/8/16/24) plus the fifth trit parked at bits 30..31.
+            // The eight dp4a code-words are then assembled with shift/mask/or only; no
+            // per-element LUT gather. Straggler trits (elements 30,31 of the chunk) come
+            // from the shared byte 24/25 via the original 5-trit LUT. Bit-identical to the
+            // per-element decode, guarded exhaustively over all 256 byte values by
+            // scripts/tests/test_b3lut_unpack.py.
+            const uint8_t * cqs = qs + 6*chunk;
+            const uint32_t T0 = ggml_cuda_b3lut_x[cqs[0]];
+            const uint32_t T1 = ggml_cuda_b3lut_x[cqs[1]];
+            const uint32_t T2 = ggml_cuda_b3lut_x[cqs[2]];
+            const uint32_t T3 = ggml_cuda_b3lut_x[cqs[3]];
+            const uint32_t T4 = ggml_cuda_b3lut_x[cqs[4]];
+            const uint32_t T5 = ggml_cuda_b3lut_x[cqs[5]];
+
+            const uint16_t Lstr = ggml_cuda_b3lut[qs[24 + (chunk >> 1)]];
+            const int      sd   = 2 * (chunk & 1);
+            const uint32_t str0 = (Lstr >> (2 * sd))     & 0x3u;
+            const uint32_t str1 = (Lstr >> (2 * sd + 2)) & 0x3u;
+
+            const uint32_t c0 = T0 & 0x03030303u;
+            const uint32_t c1 = (T0 >> 30)                 | (T1 << 8);
+            const uint32_t c2 = ((T1 >> 24) & 0x3u)        | ((T1 >> 30) << 8) | (T2 << 16);
+            const uint32_t c3 = ((T2 >> 16) & 0x0303u)     | ((T2 >> 30) << 16) | (T3 << 24);
+            const uint32_t c4 = ((T3 >> 8)  & 0x030303u)   | ((T3 >> 30) << 24);
+            const uint32_t c5 = T4 & 0x03030303u;
+            const uint32_t c6 = (T4 >> 30)                 | (T5 << 8);
+            const uint32_t c7 = ((T5 >> 24) & 0x3u)        | ((T5 >> 30) << 8) | (str0 << 16) | (str1 << 24);
+
+            // Two independent dp4a accumulator chains so RDNA3 can VOPD-dual-issue the
+            // unpack ALU against the sudot4 dots (int add is exact/associative).
+            int s0 = 0, s1 = 0;
+            s0 = ggml_cuda_dp4a((int) c0, get_int_b4(bq8->qs, 0), s0);
+            s1 = ggml_cuda_dp4a((int) c1, get_int_b4(bq8->qs, 1), s1);
+            s0 = ggml_cuda_dp4a((int) c2, get_int_b4(bq8->qs, 2), s0);
+            s1 = ggml_cuda_dp4a((int) c3, get_int_b4(bq8->qs, 3), s1);
+            s0 = ggml_cuda_dp4a((int) c4, get_int_b4(bq8->qs, 4), s0);
+            s1 = ggml_cuda_dp4a((int) c5, get_int_b4(bq8->qs, 5), s1);
+            s0 = ggml_cuda_dp4a((int) c6, get_int_b4(bq8->qs, 6), s0);
+            s1 = ggml_cuda_dp4a((int) c7, get_int_b4(bq8->qs, 7), s1);
+
+            acc += d * (d8 * (float)(s0 + s1) - s8);
+        }
+    }
+    return acc;
+}
+
+// One wave computes one output row. With has_gate the SAME wave also computes the gate
+// row for that output, so the q8_1 activation blocks are fetched once and dotted twice --
+// this is why the fused FFN gate/up projection belongs on this path rather than falling
+// through to the generic mmvq kernel.
+//
+// NCOLS is the activation batch width. NCOLS == 1 is the shipped decode path. For NCOLS > 1
+// each wave walks the same weight row once per column, so the row's decode is reused across
+// columns; the activation base advances by stride_col_y block_q8_1 units per column and the
+// destination by stride_col_dst floats. Gate/bias fusion is excluded at NCOLS > 1 (enforced
+// at the dispatch gate), so has_gate is false in those instantiations.
+template <int warp_size, int nwaves, bool is_b3, bool has_gate, int NCOLS>
+static __global__ void __launch_bounds__(warp_size*nwaves, 1) mul_mat_vec_ternary_decode(
+        const void * __restrict__ vx, const void * __restrict__ vgate, const void * __restrict__ vy,
+        float * __restrict__ dst, const float * __restrict__ x_bias, const float * __restrict__ gate_bias,
+        const int ncols_x, const int stride_row_x, const int nrows_x, const ggml_glu_op glu_op,
+        const int stride_col_y, const int stride_col_dst) {
+    const int row = blockIdx.x*nwaves + threadIdx.y;
+    if (row >= nrows_x) {
+        return;
+    }
+    const int lane    = threadIdx.x;
+    const int nblocks = ncols_x / (is_b3 ? QK2_B3 : QK2_0);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    static_assert(NCOLS == 1 || !has_gate, "batch-N excludes gate fusion");
+
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const block_q8_1 * yj = y + (size_t) j * stride_col_y;
+
+        float acc;
+        if constexpr (is_b3) {
+            acc = ternary_row_partial_q2_b3<warp_size>(vx, yj, row, nblocks, stride_row_x, lane);
+        } else {
+            acc = ternary_row_partial_q2_0<warp_size>(vx, yj, row, nblocks, stride_row_x, lane);
+        }
+        acc = warp_reduce_sum<warp_size>(acc);
+
+        float gate_acc = 0.0f;
+        if constexpr (has_gate) {
+            if constexpr (is_b3) {
+                gate_acc = ternary_row_partial_q2_b3<warp_size>(vgate, yj, row, nblocks, stride_row_x, lane);
+            } else {
+                gate_acc = ternary_row_partial_q2_0<warp_size>(vgate, yj, row, nblocks, stride_row_x, lane);
+            }
+            gate_acc = warp_reduce_sum<warp_size>(gate_acc);
+        }
+
+        if (lane != 0) {
+            continue;
+        }
+
+        // Epilogue mirrors the generic mmvq fusion epilogue exactly (x_scale/gate_scale are
+        // NVFP4-only and cannot be set for a ternary type, so they are absent here).
+        // x_bias and gate_bias are independently optional, exactly as in the generic path
+        // (which zero-initializes the bias arrays); only lane 0 gets here, so the branches
+        // cost nothing measurable.
+        float result = acc;
+        if (x_bias != nullptr) {
+            result += x_bias[row];
+        }
+        if constexpr (has_gate) {
+            float gate_value = gate_acc;
+            if (gate_bias != nullptr) {
+                gate_value += gate_bias[row];
+            }
+            switch (glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                    break;
+                default:
+                    result = result * gate_value;
+                    break;
+            }
+        }
+        dst[(size_t) j * stride_col_dst + row] = result;
+    }
+}
+
+// Paired ternary GEMV: two INDEPENDENT projections that share the same activation vector,
+// issued as one dispatch over the concatenation of their rows.
+//
+// Rationale (measured, gfx1100). Achieved bandwidth scales with how much a single dispatch
+// moves: 42 MB shapes reach 750 GB/s and the 20 MB lm_head 940 GB/s, but the 7.4 MB
+// attn_gate stalls at 372 GB/s and 12 MB attn_qkv at 589 GB/s -- small kernels cannot
+// amortize their launch ramp. That deficit is NOT a parallelism problem: both re-
+// decompositions were measured strictly worse (multi-row R=2/4/8 -> 63.78/52.64/37.83;
+// split-k NSPLIT=2/4/8 -> 67.00/66.11/65.85, vs 68.80 one-wave-per-row). The only way up is
+// to make each dispatch bigger.
+//
+// qkv (m=10240) and gate (m=6144) are independent, share `input`, and occur in all 48
+// linear-attention layers: 20.87 + 19.82 = 40.69 us today for 19.66 MB (483 GB/s). As one
+// m=16384 dispatch in the 750 GB/s regime that is ~26 us.
+//
+// Rows below nrows_a come from the first matrix, the rest from the second. With one wave
+// per row there is no intra-wave divergence at the boundary.
+// Up to this many independent projections may share one dispatch.
+#define TQ_MULTI_MAX TQ_CUDA_MULTI_MAX
+
+struct tq_multi_args {
+    const void * vx[TQ_MULTI_MAX];
+    float *      dst[TQ_MULTI_MAX];
+    int          row_end[TQ_MULTI_MAX];        // cumulative row boundaries; row_end[N-1] == total
+    int          stride_col_dst[TQ_MULTI_MAX]; // PER-SLOT dst column stride (that member's rows)
+};
+
+template <int warp_size, int nwaves, bool is_b3, int N, int NCOLS>
+static __global__ void __launch_bounds__(warp_size*nwaves, 1) mul_mat_vec_ternary_decode_multi(
+        const tq_multi_args args, const void * __restrict__ vy,
+        const int ncols_x, const int stride_row_x, const int stride_col_y) {
+    // The verify-width instantiations keep the batch-N geometry of one wave per row (see
+    // mul_mat_vec_q_ternary_decode_nwaves for why); the launch site never combines them.
+    static_assert(NCOLS == 1 || nwaves == 1, "N-way at NCOLS > 1 is one wave per row");
+    const int row = blockIdx.x*nwaves + threadIdx.y;
+    if (row >= args.row_end[N-1]) {
+        return;
+    }
+    const int lane    = threadIdx.x;
+    const int nblocks = ncols_x / (is_b3 ? QK2_B3 : QK2_0);
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    // Select the owning matrix with COMPILE-TIME indices. Indexing args.vx[] by a runtime
+    // value would push the whole struct into scratch memory; measured, that cost the fused
+    // 4-way shape 634 GB/s against 812 GB/s for the equivalent select-based pair kernel.
+    // The unrolled loop keeps every subscript constant, so these stay in registers -- the
+    // per-slot stride_col_dst is resolved in the SAME loop for the same reason.
+    const void * vx   = args.vx[0];
+    float *      dstp = args.dst[0];
+    int          base = 0;
+    int          stride_col_dst = args.stride_col_dst[0];
+#pragma unroll
+    for (int t = 1; t < N; ++t) {
+        if (row >= args.row_end[t-1]) {
+            vx   = args.vx[t];
+            dstp = args.dst[t];
+            base = args.row_end[t-1];
+            stride_col_dst = args.stride_col_dst[t];
+        }
+    }
+    const int r = row - base;
+
+    // One accumulator per activation column, mirroring the batch-N decode kernel. The shared
+    // activation's columns sit at j*stride_col_y in the q8_1 buffer (the main path's layout,
+    // member's dst columns sit at j*stride_col_dst for ITS OWN row count.
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        const block_q8_1 * yj = y + (size_t) j * stride_col_y;
+
+        float acc;
+        if constexpr (is_b3) {
+            acc = ternary_row_partial_q2_b3<warp_size>(vx, yj, r, nblocks, stride_row_x, lane);
+        } else {
+            acc = ternary_row_partial_q2_0<warp_size>(vx, yj, r, nblocks, stride_row_x, lane);
+        }
+        acc = warp_reduce_sum<warp_size>(acc);
+
+        if (lane == 0) {
+            dstp[(size_t) j * stride_col_dst + r] = acc;
+        }
+    }
+}
+
+// Waves-per-block is PER-TYPE (context-adaptive dispatch). Measured on gfx1100
+// (RX 7900 XTX), tg128 over the Ternary-Bonsai-27B decode workload:
+//   q2_0 : nwaves=2 is best (60.2 -> 61.6); nwaves=1/4/8 are flat-to-worse.
+//   q2_b3: nwaves=1 is best; nwaves>=2 regresses (heavier LUT-decode kernel has
+//          higher VGPR pressure, so larger blocks cut occupancy).
+// Each block runs `nwaves` independent warps on distinct rows; grid = ceil(nrows/nwaves).
+#define TQ_TERNARY_NWAVES_Q2_0  2
+#define TQ_TERNARY_NWAVES_Q2_B3 1
+
+// Sweep/override knobs. These exist so the tuned constants above can be re-measured from a
+// SINGLE binary (no rebuild, no stash) whenever the kernel body changes and invalidates an
+// earlier sweep -- which is exactly what happened to the nwaves numbers above.
+//   TQ_TERNARY_NWAVES_B3 / _Q20 : override waves-per-block (1, 2, 4 or 8).
+//   TQ_HIP_NO_TERNARY_FUSION    : force gate/bias-fused GEMV back to the generic mmvq path,
+//                                 so old vs new can be A/B'd for output equality in place.
+static int tq_ternary_env(const char * name, int fallback) {
+    const char * s = getenv(name);
+    if (s == nullptr) {
+        return fallback;
+    }
+    const int v = atoi(s);
+    return (v == 1 || v == 2 || v == 4 || v == 8) ? v : fallback;
+}
+
+static bool tq_ternary_fusion_disabled() {
+    static const bool disabled = getenv("TQ_HIP_NO_TERNARY_FUSION") != nullptr;
+    return disabled;
+}
+
+// TQ_HIP_NO_Q8_1_CACHE=1 restores one src1 quantization per matmul, for A/B from one binary.
+static bool tq_no_q8_1_cache() {
+    static const bool disabled = getenv("TQ_HIP_NO_Q8_1_CACHE") != nullptr;
+    return disabled;
+}
+
+// Widest activation the q8_1 cache will hold. 1 is plain decode; 2 is the speculative verify
+// step at the shipped n_max = 1, which is itself derived from the fattn VEC width bound
+// ggml-alloc keeps a node's contents alive from producer to last consumer whatever its column
+// count -- so this bound is a retained-pool-memory budget, not a correctness limit: raising it
+// costs ~5.5 KB per distinct activation per extra column. It must stay a `<=` bound; pinning it
+// to a single width would take the cache away from the width it already serves.
+#define TQ_Q8_1_CACHE_MAX_NE11 2
+
+// TQ_HIP_NO_TERNARY_BATCH_N=1 sends ncols_dst > 1 back to the generic mmvq kernel, so the
+// batch-N body can be A/B'd against the incumbent from ONE binary. ncols_dst == 1 is the
+// shipped decode path and is unaffected by this variable in either state; the arm that ran is
+// witnessed by the kernel name in a dispatch trace, not inferred from the timing.
+static bool tq_ternary_batch_n_disabled() {
+    static const bool disabled = getenv("TQ_HIP_NO_TERNARY_BATCH_N") != nullptr;
+    return disabled;
+}
+
+// TQ_HIP_NO_NWAY_W2=1 narrows the N-way pair admission back to batch-1 -- the exact pre-W5
+// dispatch pattern -- so the verify-width (ne11 == 2) consolidation can be A/B'd from ONE
+// binary. Read ONCE into a static: an env flipped mid-run must not change behaviour between
+// paired arms (same discipline as TQ_HIP_NO_TERNARY_BATCH_N above).
+static bool tq_nway_w2_disabled() {
+    static const bool disabled = getenv("TQ_HIP_NO_NWAY_W2") != nullptr;
+    return disabled;
+}
+
+template <int warp_size, int nwaves, bool is_b3, int NCOLS>
+static void mul_mat_vec_q_ternary_decode_launch(
+        const void * vx, const void * vgate, const void * vy, float * dst,
+        const float * x_bias, const float * gate_bias, const ggml_glu_op glu_op,
+        const int ncols_x, const int nrows_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    const dim3 block_nums((nrows_x + nwaves - 1) / nwaves, 1, 1);
+    const dim3 block_dims(warp_size, nwaves, 1);
+    if constexpr (NCOLS == 1) {
+        if (vgate != nullptr) {
+            mul_mat_vec_ternary_decode<warp_size, nwaves, is_b3, true, 1><<<block_nums, block_dims, 0, stream>>>(
+                vx, vgate, vy, dst, x_bias, gate_bias, ncols_x, stride_row_x, nrows_x, glu_op, stride_col_y, stride_col_dst);
+        } else {
+            mul_mat_vec_ternary_decode<warp_size, nwaves, is_b3, false, 1><<<block_nums, block_dims, 0, stream>>>(
+                vx, vgate, vy, dst, x_bias, gate_bias, ncols_x, stride_row_x, nrows_x, glu_op, stride_col_y, stride_col_dst);
+        }
+    } else {
+        // Batch-N excludes gate/bias fusion: has_gate is false in the instantiation and the
+        // gate/bias pointers are literal nulls at the launch site, so no fused argument can
+        // reach the kernel even if the dispatch gate were ever relaxed by mistake.
+        GGML_ASSERT(vgate == nullptr && x_bias == nullptr && gate_bias == nullptr);
+        mul_mat_vec_ternary_decode<warp_size, nwaves, is_b3, false, NCOLS><<<block_nums, block_dims, 0, stream>>>(
+            vx, nullptr, vy, dst, nullptr, nullptr, ncols_x, stride_row_x, nrows_x, glu_op, stride_col_y, stride_col_dst);
+    }
+}
+
+// Runtime nwaves selection. Templated on nwaves for codegen, chosen per call.
+//
+// Waves-per-block is a batch-1 knob. The per-type constants above were measured with one
+// accumulator and one dp4a chain per wave; a batch-N wave carries NCOLS of each, and the generic
+// kernel it displaces already runs one wave per row at ncols_dst > 1 (calc_nwarps and
+// calc_rows_per_block both return 1 there). Batch-N therefore keeps exactly that geometry --
+// block (warp_size,1,1), grid (nrows_x,1,1) -- which is what makes the A/B a pure kernel-body
+// swap, and it is why nwaves > 1 is never instantiated for NCOLS > 1.
+template <int warp_size, bool is_b3, int NCOLS>
+static void mul_mat_vec_q_ternary_decode_nwaves(
+        const int nwaves,
+        const void * vx, const void * vgate, const void * vy, float * dst,
+        const float * x_bias, const float * gate_bias, const ggml_glu_op glu_op,
+        const int ncols_x, const int nrows_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    if constexpr (NCOLS == 1) {
+        switch (nwaves) {
+            case 2:
+                mul_mat_vec_q_ternary_decode_launch<warp_size, 2, is_b3, NCOLS>(vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+                break;
+            case 4:
+                mul_mat_vec_q_ternary_decode_launch<warp_size, 4, is_b3, NCOLS>(vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+                break;
+            case 8:
+                mul_mat_vec_q_ternary_decode_launch<warp_size, 8, is_b3, NCOLS>(vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+                break;
+            default:
+                mul_mat_vec_q_ternary_decode_launch<warp_size, 1, is_b3, NCOLS>(vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+                break;
+        }
+    } else {
+        GGML_ASSERT(nwaves == 1);
+        mul_mat_vec_q_ternary_decode_launch<warp_size, 1, is_b3, NCOLS>(vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+    }
+}
+
+// Widest activation batch the bespoke path serves. Bounded by MMVQ_MAX_BATCH_SIZE: above it
+// ggml_cuda_should_use_mmvq sends the matmul to MMQ and this kernel is never reached at all.
+#define TQ_TERNARY_MAX_NCOLS 8
+static_assert(TQ_TERNARY_MAX_NCOLS <= MMVQ_MAX_BATCH_SIZE,
+              "the ternary decode path cannot claim widths MMVQ never routes to it");
+
+// Runtime ncols_dst -> compile-time NCOLS. One arm per admissible width, every template
+// argument a literal: a runtime value must never reach a fixed-NCOLS instantiation, which is
+// the silent launch-geometry/template mismatch this file has already been burned by once. The
+// default arm aborts loudly rather than falling through to some instantiation -- the caller's
+// dispatch gate is what bounds ncols_dst to [1, TQ_TERNARY_MAX_NCOLS].
+template <int warp_size, bool is_b3>
+static void mul_mat_vec_q_ternary_decode_ncols(
+        const int ncols_dst, const int nwaves,
+        const void * vx, const void * vgate, const void * vy, float * dst,
+        const float * x_bias, const float * gate_bias, const ggml_glu_op glu_op,
+        const int ncols_x, const int nrows_x, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    static_assert(TQ_TERNARY_MAX_NCOLS == 8, "one switch arm per admissible NCOLS");
+#define TQ_TERNARY_NCOLS_CASE(N)                                                                  \
+    case N:                                                                                         \
+        mul_mat_vec_q_ternary_decode_nwaves<warp_size, is_b3, N>(                                   \
+            nwaves, vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x,  \
+            stride_col_y, stride_col_dst, stream);                                                  \
+        break;
+    switch (ncols_dst) {
+        TQ_TERNARY_NCOLS_CASE(1)
+        TQ_TERNARY_NCOLS_CASE(2)
+        TQ_TERNARY_NCOLS_CASE(3)
+        TQ_TERNARY_NCOLS_CASE(4)
+        TQ_TERNARY_NCOLS_CASE(5)
+        TQ_TERNARY_NCOLS_CASE(6)
+        TQ_TERNARY_NCOLS_CASE(7)
+        TQ_TERNARY_NCOLS_CASE(8)
+        default:
+            GGML_ABORT("ternary decode: unsupported ncols_dst %d", ncols_dst);
+    }
+#undef TQ_TERNARY_NCOLS_CASE
+}
+
+// Launch the bespoke ternary decode kernel. Caller guarantees the decode preconditions.
+static void mul_mat_vec_q_ternary_decode(
+        const void * vx, const ggml_type type_x, const void * vgate, const void * vy, float * dst,
+        const float * x_bias, const float * gate_bias, const ggml_glu_op glu_op,
+        const int ncols_x, const int nrows_x, const int ncols_dst, const int stride_row_x,
+        const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
+    const int device    = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    // Waves-per-block is a batch-1 knob (and so is its env override); batch-N is one wave per
+    // row, see mul_mat_vec_q_ternary_decode_nwaves.
+    if (type_x == GGML_TYPE_Q2_0) {
+        static const int nwaves_tuned = tq_ternary_env("TQ_TERNARY_NWAVES_Q20", TQ_TERNARY_NWAVES_Q2_0);
+        const int nwaves = ncols_dst == 1 ? nwaves_tuned : 1;
+        if (warp_size == 64) {
+            mul_mat_vec_q_ternary_decode_ncols<64, false>(ncols_dst, nwaves, vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+        } else {
+            mul_mat_vec_q_ternary_decode_ncols<32, false>(ncols_dst, nwaves, vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+        }
+    } else { // GGML_TYPE_Q2_B3
+        static const int nwaves_tuned = tq_ternary_env("TQ_TERNARY_NWAVES_B3", TQ_TERNARY_NWAVES_Q2_B3);
+        const int nwaves = ncols_dst == 1 ? nwaves_tuned : 1;
+        if (warp_size == 64) {
+            mul_mat_vec_q_ternary_decode_ncols<64, true>(ncols_dst, nwaves, vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+        } else {
+            mul_mat_vec_q_ternary_decode_ncols<32, true>(ncols_dst, nwaves, vx, vgate, vy, dst, x_bias, gate_bias, glu_op, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream);
+        }
+    }
+}
+
+// Host entry for the paired ternary GEMV. Preconditions are checked by
+// ggml_cuda_should_fuse_mul_mat_vec_q_pair; this only dispatches.
+void ggml_cuda_mul_mat_vec_q_multi(
+        ggml_backend_cuda_context & ctx, ggml_tensor ** nodes, int n_nodes) {
+    GGML_ASSERT(n_nodes >= 2 && n_nodes <= TQ_MULTI_MAX);
+    const ggml_tensor * src0_a = nodes[0]->src[0];
+    const ggml_tensor * src1   = nodes[0]->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10        = src1->ne[0];
+    const int64_t ne11        = src1->ne[1];
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    // The pair predicate admits at most TQ_Q8_1_CACHE_MAX_NE11 activation columns, and the
+    // kernel below is instantiated for NCOLS in {1, 2} only: raising the bound needs new
+    // instantiation arms first, and both assertions below keep that raise LOUD.
+    static_assert(TQ_Q8_1_CACHE_MAX_NE11 == 2,
+                  "mul_mat_vec_ternary_decode_multi instantiates NCOLS in {1, 2} only");
+    GGML_ASSERT(ne11 >= 1 && ne11 <= TQ_Q8_1_CACHE_MAX_NE11);
+
+    // Sized by ne11 exactly like the main path (ne12 == ne13 == 1 is guaranteed by the pair
+    // predicate). The entry this seeds carries the main path's layout -- column j at
+    // j*(ne10_padded/QK8_1) -- so a same-width main-path consumer may reuse it in place
+    const size_t  q8_1_nelem  = ne11 * ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // All group members consume the same src1 node, so this hits the graph-scoped q8_1 cache
+    // whenever anything else in the layer already quantized it, and seeds it otherwise.
+    // The lookup keys on ne11 and the entry records the REAL ne11, so a width-1 entry seeded
+    // elsewhere is a MISS for a width-2 consumer (and vice versa) instead of an out-of-bounds
+    // read; a miss falls through to a fresh quantization and never evicts, because a
+    // narrower consumer may still be pending on the entry it missed.
+    char * src1_q8_1_ptr = nullptr;
+    for (const auto & e : ctx.q8_1_cache) {
+        if (e.src1 == src1 && e.src0_type == src0_a->type && e.ne10 == ne10
+                && e.ne11 == ne11 && e.alloc_nelem >= q8_1_nelem) {
+            src1_q8_1_ptr = e.buf;
+            break;
+        }
+    }
+    if (src1_q8_1_ptr == nullptr) {
+        ctx.q8_1_cache_allocs.emplace_back(new ggml_cuda_pool_alloc<char>(ctx.pool(), q8_1_nelem));
+        src1_q8_1_ptr = ctx.q8_1_cache_allocs.back()->get();
+        ctx.q8_1_cache.push_back({ src1, src0_a->type, ne10, ne11, q8_1_nelem, src1_q8_1_ptr });
+        const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+        const int64_t s12 = src1->nb[2] / ggml_type_size(src1->type);
+        const int64_t s13 = src1->nb[3] / ggml_type_size(src1->type);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1_ptr, src0_a->type,
+                               ne10, s11, s12, s13, ne10_padded, ne11, 1, 1, stream);
+    }
+
+    tq_multi_args args{};
+    int cum = 0;
+    for (int t = 0; t < n_nodes; ++t) {
+        cum += (int) nodes[t]->src[0]->ne[1];
+        args.vx[t]             = nodes[t]->src[0]->data;
+        args.dst[t]            = (float *) nodes[t]->data;
+        args.row_end[t]        = cum;
+        args.stride_col_dst[t] = (int) nodes[t]->ne[0]; // contiguous dst: column j at j*ne0
+    }
+    // Unused slots repeat the last boundary so the compile-time unrolled search is safe.
+    for (int t = n_nodes; t < TQ_MULTI_MAX; ++t) {
+        args.vx[t]             = args.vx[n_nodes-1];
+        args.dst[t]            = args.dst[n_nodes-1];
+        args.row_end[t]        = cum;
+        args.stride_col_dst[t] = args.stride_col_dst[n_nodes-1];
+    }
+
+    const int nrows_total = cum;
+    const int stride_row  = src0_a->nb[1] / ggml_type_size(src0_a->type);
+    const int warp_size   = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const bool is_b3      = src0_a->type == GGML_TYPE_Q2_B3;
+
+    // Waves-per-block for the FUSED shapes is tuned separately from the single-matrix
+    // kernel. Achieved bandwidth rises with dispatch size (7.4 MB -> 372 GB/s, 19.8 MB ->
+    // 648, 41.8 MB -> 738, 357 MB -> 919), and fusion moves these shapes into the larger
+    // regime where the single-matrix tuning (nwaves=1, chosen against small shapes) may no
+    // longer be right. TQ_TERNARY_MULTI_NWAVES overrides for sweeping.
+    const int nwaves_default = is_b3 ? TQ_TERNARY_NWAVES_Q2_B3 : TQ_TERNARY_NWAVES_Q2_0;
+    static const int nwaves_tuned = tq_ternary_env("TQ_TERNARY_MULTI_NWAVES", nwaves_default);
+    // Waves-per-block is a batch-1 knob here as everywhere (see
+    // mul_mat_vec_q_ternary_decode_nwaves): at the verify width the group keeps the batch-N
+    // geometry of one wave per row, and NCOLS > 1 is never instantiated with nwaves > 1.
+    const int nwaves = ne11 == 1 ? nwaves_tuned : 1;
+
+    const int stride_col_y = (int) (ne10_padded / QK8_1);
+
+    const dim3 block_nums((nrows_total + nwaves - 1) / nwaves, 1, 1);
+    const dim3 block_dims(warp_size, nwaves, 1);
+
+#define TQ_LAUNCH_MULTI(WS, NW, B3, N, NC)                                                       \
+    mul_mat_vec_ternary_decode_multi<WS, NW, B3, N, NC><<<block_nums, block_dims, 0, stream>>>(   \
+        args, src1_q8_1_ptr, ne10, stride_row, stride_col_y)
+
+#define TQ_LAUNCH_MULTI_N(WS, NW, B3, NC)                       \
+    switch (n_nodes) {                                          \
+        case 2: TQ_LAUNCH_MULTI(WS, NW, B3, 2, NC); break;      \
+        case 3: TQ_LAUNCH_MULTI(WS, NW, B3, 3, NC); break;      \
+        default: TQ_LAUNCH_MULTI(WS, NW, B3, 4, NC); break;     \
+    }
+
+// The template's wave count MUST match the launch geometry: block_dims/block_nums are
+// computed from the runtime `nwaves`, so dispatch on it rather than baking in the
+// compile-time default (doing the latter launched N waves into a kernel compiled for one).
+// The ne11 == 1 arm is the exact pre-W5 dispatch; NCOLS = 2 exists only with one wave per
+// row, so the NCOLS > 1 x nwaves > 1 combination is never even instantiated.
+#define TQ_LAUNCH_MULTI_W(WS, B3)                               \
+    if (ne11 == 1) {                                            \
+        switch (nwaves) {                                       \
+            case 2:  TQ_LAUNCH_MULTI_N(WS, 2, B3, 1); break;    \
+            case 4:  TQ_LAUNCH_MULTI_N(WS, 4, B3, 1); break;    \
+            default: TQ_LAUNCH_MULTI_N(WS, 1, B3, 1); break;    \
+        }                                                       \
+    } else {                                                    \
+        TQ_LAUNCH_MULTI_N(WS, 1, B3, 2);                        \
+    }
+
+    if (warp_size == 64) {
+        if (is_b3) { TQ_LAUNCH_MULTI_W(64, true); }
+        else       { TQ_LAUNCH_MULTI_W(64, false); }
+    } else {
+        if (is_b3) { TQ_LAUNCH_MULTI_W(32, true); }
+        else       { TQ_LAUNCH_MULTI_W(32, false); }
+    }
+#undef TQ_LAUNCH_MULTI_W
+#undef TQ_LAUNCH_MULTI_N
+#undef TQ_LAUNCH_MULTI
+}
+
+// Two adjacent MUL_MAT nodes qualify for the paired ternary GEMV when they are the same
+// ternary type, read the SAME src1 node, agree on k and row stride, and are a GEMV of at
+// most TQ_Q8_1_CACHE_MAX_NE11 activation columns with no ids and no fusion epilogue.
+bool ggml_cuda_should_fuse_mul_mat_vec_q_pair(const ggml_tensor * a, const ggml_tensor * b) {
+    // same reason as the fast-path gate in mul_mat_vec_q_switch_type: this fusion ends in the
+    // RDNA3 ternary kernel, and q2_0 is an upstream type that must keep its own path elsewhere
+    if (!GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        return false;
+    }
+    if (a == nullptr || b == nullptr) {
+        return false;
+    }
+    const ggml_tensor * a0 = a->src[0];
+    const ggml_tensor * b0 = b->src[0];
+    if (a0 == nullptr || b0 == nullptr) {
+        return false;
+    }
+    if (a0->type != b0->type) {
+        return false;
+    }
+    if (a0->type != GGML_TYPE_Q2_0 && a0->type != GGML_TYPE_Q2_B3) {
+        return false;
+    }
+    if (a->src[1] != b->src[1] || a->src[1] == nullptr) {           // same activation node
+        return false;
+    }
+    if (a->src[2] != nullptr || b->src[2] != nullptr) {             // no MUL_MAT_ID
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a0->ne[0] != b0->ne[0]) {                                   // same k
+        return false;
+    }
+    if (a0->nb[1] != b0->nb[1]) {                                   // same row stride
+        return false;
+    }
+    // WIDTH GATE: the shared activation may carry at most TQ_Q8_1_CACHE_MAX_NE11 columns --
+    // the q8_1 cache bound -- and TQ_HIP_NO_NWAY_W2=1 narrows admission back to batch-1 (the
+    // exact pre-W5 dispatch pattern) so the widening can be A/B'd from ONE binary.
+    //
+    // TWO reasons bound this width, and satisfying only the first arms a silent bug
+    // (1) Kernel geometry: mul_mat_vec_ternary_decode_multi carries per-column accumulators
+    //     for NCOLS in {1, 2} ONLY, one wave per row at NCOLS > 1.
+    // (2) q8_1 CACHE SIZING: ggml_cuda_mul_mat_vec_q_multi writes ctx.q8_1_cache under the
+    //     same key as the main path. The main path serves up to TQ_Q8_1_CACHE_MAX_NE11
+    //     columns and reads column j at j*(ne10_padded/QK8_1); an entry seeded NARROWER than
+    //     its consumer is an out-of-bounds device read with no fault -- garbage in the
+    //     speculative verify step's second column of logits. The N-way path therefore sizes
+    //     its allocation by ne11 and keys its lookup on ne11 (a narrow entry is a MISS for a
+    //     wider consumer, never a reuse), and this gate keeps any activation wider than the
+    //     cache bound out of the N-way path entirely, so no admitted width can ever outrun
+    //     what the N-way path seeds. Whoever widens this path further must move the kernel
+    //     instantiations, the allocation, the lookup key and this bound TOGETHER.
+    const ggml_tensor * s1 = a->src[1];
+    const int64_t max_ne11 = tq_nway_w2_disabled() ? 1 : TQ_Q8_1_CACHE_MAX_NE11;
+    if (s1->ne[1] < 1 || s1->ne[1] > max_ne11 || s1->ne[2] != 1 || s1->ne[3] != 1) {
+        return false;
+    }
+    if (a0->ne[2] != 1 || a0->ne[3] != 1 || b0->ne[2] != 1 || b0->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(s1)) {
+        return false;
+    }
+    return true;
+}
+
 static void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
@@ -1101,6 +1797,41 @@ static void mul_mat_vec_q_switch_type(
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride, cudaStream_t stream) {
+    // Bespoke RDNA3 ternary decode fast path: GEMV over q2_0 / q2_b3 for an activation batch of
+    // 1..TQ_TERNARY_MAX_NCOLS columns, with no channels/samples and no ids. Gate/bias fusion IS
+    // handled here at ncols_dst == 1: the FFN gate+up projection is the largest matmul in a
+    // ternary decode step, and excluding it sent it to the generic mmvq kernel at ~2.3x the cost
+    // (measured on gfx1100, Q2_B3: m=17408 68.9 us generic vs 30.1 us for the equivalent Vulkan
+    // int-dot path). Note that comparison is batch-1: at ncols_dst == 8 the generic kernel
+    // already hoists the weight load and its decode out of its column loop, so the batch-N
+    // instantiation buys decode ALU, NOT weight bandwidth.
+    // Gate/bias fusion and batch-N are mutually exclusive, not merely unimplemented together:
+    // the generic broadcast bias read x_bias[j*stride_col_dst + ...] is in bounds only for
+    // j == 0. That exclusion is enforced here, at the one dispatch gate.
+    // x_scale/gate_scale remain excluded: they are asserted NVFP4-only upstream, so a
+    // ternary tensor can never carry them, and the kernel implements no scale term.
+    // Anything not covered falls through to the generic path unchanged.
+    // q2_0 is an upstream type with its own tuned mmvq path, so the RDNA3 check is what keeps
+    // this fork kernel from displacing it on hardware where it was never measured.
+    if ((type_x == GGML_TYPE_Q2_0 || type_x == GGML_TYPE_Q2_B3)
+            && ncols_dst >= 1 && ncols_dst <= TQ_TERNARY_MAX_NCOLS && ids == nullptr
+            && nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1
+            && nsamples_x == 1 && nsamples_dst == 1
+            && fusion.x_scale == nullptr && fusion.gate_scale == nullptr
+            && (ncols_dst == 1
+                || (!tq_ternary_batch_n_disabled()
+                    && fusion.gate == nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr))
+            && !(tq_ternary_fusion_disabled()
+                 && (fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr))
+            && GGML_CUDA_CC_IS_RDNA3(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        // fusion.glu_op is only meaningful when a gate is present (the struct leaves it
+        // default-initialized otherwise), so do not read it unless there is one.
+        const ggml_glu_op glu_op = fusion.gate != nullptr ? fusion.glu_op : GGML_GLU_OP_SWIGLU;
+        mul_mat_vec_q_ternary_decode(vx, type_x, fusion.gate, vy, dst,
+            (const float *) fusion.x_bias, (const float *) fusion.gate_bias, glu_op,
+            ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst, stream);
+        return;
+    }
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
@@ -1110,6 +1841,12 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_Q2_B3:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_B3>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
@@ -1324,12 +2061,53 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_nelem  = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // Reuse an activation vector already quantized for an earlier matmul in this same graph.
+    // Restricted to the narrow batches over the ternary types: that is where the redundancy is
+    // (432 matmuls / 257 distinct src1 nodes per decode token, and the speculative verify step
+    // repeats it over TQ_Q8_1_CACHE_MAX_NE11 columns), and it bounds the retained pool memory to
+    // ~257 * 5.5 KB per column. Prefill keeps the original per-call allocation, where the buffers
+    // are large and each src1 is typically consumed once.
+    const bool q8_1_cacheable = !tq_no_q8_1_cache()
+        && (src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_Q2_B3)
+        && ids == nullptr && ne11 <= TQ_Q8_1_CACHE_MAX_NE11 && ne12 == 1 && ne13 == 1;
+
+    char * src1_q8_1_ptr = nullptr;
+    ggml_cuda_pool_alloc<char> src1_q8_1_local;
+
+    if (q8_1_cacheable) {
+        for (const auto & e : ctx.q8_1_cache) {
+            // Node identity, quantization target type and row length are what make the CONTENTS
+            // reusable; the width and the allocated size are what make the BUFFER usable. An
+            // entry too narrow for this consumer falls through to a fresh quantization -- it is
+            // never evicted, because a narrower consumer may still be pending on it.
+            if (e.src1 == src1 && e.src0_type == src0->type && e.ne10 == ne10
+                    && e.ne11 == ne11 && e.alloc_nelem >= q8_1_nelem) {
+                src1_q8_1_ptr = e.buf;
+                break;
+            }
+        }
+    }
+
+    if (src1_q8_1_ptr == nullptr) {
+        char * buf;
+        if (q8_1_cacheable) {
+            // Held in the context so the allocation outlives this call and stays valid for
+            // the rest of the graph; released by q8_1_cache_reset() at the next graph.
+            ctx.q8_1_cache_allocs.emplace_back(new ggml_cuda_pool_alloc<char>(ctx.pool(), q8_1_nelem));
+            buf = ctx.q8_1_cache_allocs.back()->get();
+            ctx.q8_1_cache.push_back({ src1, src0->type, ne10, ne11, q8_1_nelem, buf });
+        } else {
+            src1_q8_1_local.alloc(ctx.pool(), q8_1_nelem);
+            buf = src1_q8_1_local.get();
+        }
+
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1_ptr = buf;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1355,7 +2133,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

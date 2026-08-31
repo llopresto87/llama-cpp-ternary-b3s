@@ -13,12 +13,6 @@ struct block_a_cache {
     uint32_t qs[16/4];
     FLOAT_TYPE dm;
 };
-#elif defined(DATA_A_Q2_0)
-#define QUANT_R_MMQ 1
-struct block_a_cache {
-    int32_t qs[8];
-    FLOAT_TYPE dm;
-};
 #elif defined(DATA_A_Q4_1)
 #define QUANT_R_MMQ 2
 struct block_a_cache {
@@ -43,6 +37,28 @@ struct block_a_cache {
 #define QUANT_R_MMQ 1
 // AMD likes 4, Intel likes 1 and Nvidia likes 2
 // #define BK_STEP 1
+struct block_a_cache {
+    int32_t qs[32/4];
+    FLOAT_TYPE dm;
+};
+#elif defined(DATA_A_Q2_0)
+#define QUANT_R_MMQ 4
+// Keep the eight compressed Q2 bytes for each 32-value half-block in LDS.
+// Expanding here used 34 bytes/chunk and forced a one-workgroup/CU LDS limit
+// on Navi 31. The 12-byte compressed form permits two resident workgroups;
+// each consuming lane expands its own register tile below.
+struct block_a_shmem {
+    uint32_t qs[2];
+    FLOAT_TYPE dm;
+};
+struct block_a_cache {
+    int32_t qs[32/4];
+    FLOAT_TYPE dm;
+};
+#elif defined(DATA_A_Q2_B3)
+#define QUANT_R_MMQ 1
+// Base-3 decode is substantially more expensive than Q2 bit spreading, so do
+// it once cooperatively on LDS load instead of repeating it in consuming lanes.
 struct block_a_cache {
     int32_t qs[32/4];
     FLOAT_TYPE dm;

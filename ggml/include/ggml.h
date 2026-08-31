@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q2_B3   = 43, // TQ base-3 ternary (5 trits/byte, 128-block)
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -475,6 +476,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q2_B3   = 29, // except 1d tensors
     };
 
     // available tensor operations:
@@ -2448,7 +2450,6 @@ extern "C" {
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
-            struct ggml_tensor * sinks);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -75,6 +75,7 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_seq_max,
                  uint32_t   n_pad,
                  uint32_t   n_swa,
+                 uint32_t   n_sink,
            llama_swa_type   swa_type,
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
@@ -82,7 +83,7 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
              const char *   name_tag) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), n_sink(n_sink), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -99,6 +100,13 @@ llama_kv_cache::llama_kv_cache(
     }
 
     GGML_ASSERT(kv_size % n_pad == 0);
+
+    // attention sinks are only honored by the standard window (see llama_hparams::is_masked_swa),
+    // so abort rather than silently dropping them under a chunked/symmetric window.
+    // llama_hparams::validate_swa() rejects this at load time, upstream of every consumer and
+    // of models that never build a cache at all; this stays as a cheap guard on the params a
+    // caller passed in, which need not be the model's own
+    GGML_ASSERT(n_sink == 0 || swa_type == LLAMA_SWA_TYPE_STANDARD);
 
     const uint32_t n_layer = hparams.n_layer_all;
 
@@ -245,9 +253,19 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        // the cache's own buffer so it survives across decode steps (§6.5's
+        // append-only steady state). n_pages is sized against the WHOLE cache, not
+        // the current n_kv, so growing context never reallocates; the per-step view
+            const int64_t  n_pages    = (kv_size + B - 1) / B;
+            const int64_t  n_head_kv  = hparams.n_head_kv(il);
+            const int64_t  n_channels = hparams.n_embd_head_k(il);
+
+            // [k_min | k_max] over the channels — the §6.3 record, 2*n_channels f16.
+                    2*n_channels, n_pages, n_head_kv, n_stream);
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -303,6 +321,16 @@ llama_kv_cache::llama_kv_cache(
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+
+        // §6.4 figure is a function of the CONFIGURED context, which print_info cannot
+        // see (it runs at model load, where only n_ctx_train is known, and would report
+        // roughly double at this operating point). These are the bytes actually
+        // allocated for this cache, which is also the quantity §4.J.2's resident-VRAM
+            for (const auto & layer : layers) {
+                }
+            }
+
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -342,6 +370,40 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
+    //
+    // §2.3 puts n_seq > 1 out of scope: selection state is per (sequence, layer, head) and
+    // nothing here is designed for the batched case. The kernel already refuses to select
+    // BACK, and a fallback is not a refusal. A batched run would therefore complete, print
+    // So it is refused at the one place that knows the sequence count, beside §4.V and for
+    // the same reason: fail closed, name the knob, do not guess.
+        throw std::runtime_error(
+            "is per (sequence, layer, head) and batched decode is out of scope. The kernel would fall "
+            "banner, so this refuses instead. Run with a single sequence (n_seq_max = 1, e.g. -np 1), "
+    }
+
+    //
+    // and queries them with the post-Hadamard query. If the rotation is absent,
+    // the bounds and the query are in DIFFERENT bases and the selector degrades
+    // from 26.0% to 0.3% needle top-1 (§7.F) — silently, with correct-looking
+    // output and no compiler-catchable signal. So this REFUSES; it does not warn,
+    //
+    // Checked against the cache's OWN resolved attn_rot_k above — never
+    // re-derived from the environment or from type_k in a second place, because a
+    // second derivation is exactly how the two come to disagree (§4.V last
+    // clause). The three triggers have different fixes, so all three are named.
+        const char * rot_disable_env = getenv("LLAMA_ATTN_ROT_DISABLE");
+        const bool   rot_disabled    = rot_disable_env ? atoi(rot_disable_env) != 0 : false;
+
+        throw std::runtime_error(std::string(
+            "  resolved type_k            = ") + ggml_type_name(type_k) + "\n"
+            "  ggml_is_quantized(type_k)  = " + (ggml_is_quantized(type_k) ? "true" : "false")
+                + "   <- false means there is NO rotation at all; run -ctk q4_0\n"
+            "  LLAMA_ATTN_ROT_DISABLE     = " + (rot_disable_env ? rot_disable_env : "(unset)")
+                + (rot_disabled ? "   <- set; unset it" : "") + "\n"
+            "  n_embd_head_k() % 64       = " + std::to_string(hparams.n_embd_head_k() % 64)
+            "  n_embd_head_k_all          = " + std::to_string(n_embd_head_k_all));
+    }
+
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
@@ -367,6 +429,92 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+    // record IS the inverted interval. There is no side array, no seventh src
+    // and no per-step op_param -- the bit rides in the one tensor ADR-0018
+    // already transports, at the layout that tensor already has.
+    //
+    // WHY THE INTERVAL IS THIS WAY ROUND, and it is not arbitrary. The
+    // selector's inner loop sums max(q_c*k_min, q_c*k_max) per channel, so BOTH
+    // orientations evaluate to +INF (or to NaN at q_c == 0, which the same line
+    // maps to +INF) and both force-attend identically. Only k_min > k_max is
+    // DETECTABLE on the device by a two-half comparison, and detection is what
+    // the CLEARING half needs: k_min = -INF, k_max = +INF is indistinguishable
+    // from a wide-but-true record without a full-width scan, so a sentinel
+    // written that way round would be honoured forever and never rebuilt. This
+    // reference resets a record -- one convention, not two.
+    //
+    // implementation rather than the production accumulator. The production
+    // host already holds rows -- sinfo.idxs in apply_ubatch, sinfo's cell
+    // walk index the same row-derived page axis. Named in rows, there is no
+    // translation left to get wrong.
+    //
+    // The bound this leaves is deliberately too WIDE, never too narrow: §4.O's
+    // "failing toward attending is deliberate" clause. A page that attends when
+    // it need not costs bandwidth; a page dropped because its bound understated
+    // it loses content silently, which is the failure no gate here can see.
+        return;
+    }
+
+
+    const int64_t page_first = row_first     / B;
+    const int64_t page_last  = (row_last_p1 - 1) / B;
+
+    const ggml_fp16_t k_min_invalid = ggml_fp32_to_fp16( std::numeric_limits<float>::infinity());
+    const ggml_fp16_t k_max_invalid = ggml_fp32_to_fp16(-std::numeric_limits<float>::infinity());
+
+    std::vector<ggml_fp16_t> rec;
+
+    uint32_t n_invalidated = 0;
+
+    for (const auto & layer : layers) {
+        if (!b) {
+        }
+
+        const int64_t n_rec      = b->ne[0];        // 2*n_channels -- the §6.3 record
+        const int64_t n_channels = n_rec/2;
+        const int64_t n_pages    = b->ne[1];
+        const int64_t n_head_kv  = b->ne[2];
+
+        if (page_first >= n_pages) {
+            continue;
+        }
+
+        const int64_t p_last = std::min(page_last, n_pages - 1);
+        const int64_t n_p    = p_last - page_first + 1;
+
+        // The half order lives HERE and nowhere else: [k_min | k_max] within a
+        // it. A second copy of this fill is a second place for the halves to be
+        // swapped, and a swap is invisible -- the page force-attends either way
+        // and only stops being clearable.
+        rec.assign((size_t) (n_p*n_rec), k_max_invalid);
+        for (int64_t p = 0; p < n_p; ++p) {
+            std::fill_n(rec.begin() + p*n_rec, n_channels, k_min_invalid);
+        }
+
+        // One transfer per KV head. Records of consecutive pages are contiguous
+        // within a head -- §6.3's index order is [record, page, kv_head, stream]
+        // -- so a page RUN is a single copy, which is what keeps `clear()`'s
+        // whole-cache invalidation a handful of transfers rather than one per
+        // page. Every KV head of a page shares the page's staleness (it is a
+        // thing by ignoring its kv_head argument), so all of them are written.
+        for (int64_t h = 0; h < n_head_kv; ++h) {
+            const size_t off = (((size_t) strm*n_head_kv + h)*n_pages + page_first)*n_rec;
+
+            ggml_backend_tensor_set(b, rec.data(),
+                    off*sizeof(ggml_fp16_t), rec.size()*sizeof(ggml_fp16_t));
+        }
+
+        n_invalidated += (uint32_t) n_p;
+    }
+
+    if (n_invalidated > 0) {
+        // §4.O requires the invalidation to be visible: a sentinel that is
+        // is what makes that a bug report instead of a slow mystery
+        // (crosscut.bench-integrity, perf.gates-that-lie).
+                __func__, row_first, row_last_p1, (int) page_first, (int) page_last, n_invalidated);
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -377,6 +525,19 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+    }
+
+    // from row 0 upward under records accumulated over content that is gone --
+    // ADR-0024 Fact 2's "new key bytes under an existing record", at the widest
+    // possible scale.
+    //
+    // AFTER the buffer clear, and that order is load-bearing: clear(data=true)
+    // zeroes the bounds tensor too, and an all-zero record is not an invalid
+    // page -- it is a k_min = k_max = 0.0 bound asserting that every key in the
+    // page is exactly zero. That is a FALSE bound, and it ranks the page last
+    // rather than attending it, which is §4.D violated in the silent direction.
+    // The device watermark cannot rescue it either: n_kv falls here, and §7.X's
+    for (uint32_t s = 0; s < n_stream; ++s) {
     }
 }
 
@@ -1054,8 +1215,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        // SWA mask - sink cells are never masked, so they are never reused
+                        if (llama_hparams::is_masked_swa(n_swa, n_sink, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -1111,12 +1272,32 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        auto & cells = v_cells[sinfo.strm[s]];
+
+        //
+        // THE HAZARD IS A WRITE BELOW THE FRONTIER, NOT AN APPEND. An ordinary
+        // decode append lands at or above used_max_p1, in a page the device's
+        // frozen-page watermark already rebuilds every step, so invalidating it
+        // would be pure per-step traffic for no correctness -- and treating an
+        // append as a mutation is exactly §7.G's rebuild storm. A slot REUSED
+        // below the frontier is the opposite case: new key bytes land under a
+        // record the watermark still considers frozen, n_kv does not move, and
+        // the bound becomes too NARROW, which drops content silently.
+        //
+        // The frontier is read BEFORE this ubatch is applied, because applying
+        // it is what moves it. It is a content watermark (used_max_p1), while
+        // the padded-and-backed-off value is never above used_max_p1/B, so
+        // every row this test calls "at or above the frontier" is in a page the
+        // device rebuilds anyway. The test errs toward invalidating, which is
+        // §4.O's safe direction.
+
+
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
-            auto & cells = v_cells[sinfo.strm[s]];
-
             const auto idx = sinfo.idxs[s][ii];
+
+            }
 
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
@@ -1156,6 +1337,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
         }
+
+        // One call per stream, over the row SPAN the reused slots covered. A
+        // span rather than a per-row call because the sentinel is a per-PAGE
+        // property: a scattered slot reuse inside one page is one record write
+        // either way, and a span keeps the transfer count bounded by the number
+        // of pages rather than by the number of tokens.
     }
 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
@@ -1187,6 +1374,26 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // half of §4.P a startup refusal structurally cannot deliver.
+    //
+    // build_rope_shift rewrites the cached keys in place, so every page bound
+    // becomes wrong at once with no cell-level event for §4.O to see (§7.J). The
+    // startup refusal in common_init_from_params covers the configuration an
+    // operator sets — --context-shift and --cache-reuse — but n_cache_reuse is
+    // ALSO a per-request completion field (tools/server/server-schema.cpp), so a
+    // client can ask for cache reuse on a server that was started without it. No
+    // startup check can see that request; this predicate can, because every route
+    // to a shift asks it first: llama_kv_cache::update()'s do_shift branch aborts
+    // on it, and the server tests it as can_cache_reuse before shifting a matched
+    // chunk. Declaring the cache unshiftable is what makes §4.P's "any path that
+    // would call build_rope_shift" true by construction rather than by
+    // enumerating callers.
+    //
+    // Read off the cache's OWN resolved hparams, the same predicate §4.N (:398)
+    // and §4.V (:421) refuse on — never re-derived from the environment (§4.V).
+        return false;
+    }
+
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1282,6 +1489,29 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+}
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    if (!b) {
+    }
+
+    // The WHOLE record array, not a view narrowed to the current n_kv.
+    //
+    // Narrowing ne[1] (pages) would produce a NON-CONTIGUOUS tensor -- pages are
+    // an inner dimension under §6.3's [kv_head, page] index order, so shrinking
+    // them leaves the kv-head stride spanning the full cache. Every consumer that
+    // then derived its own stride from ne[1] would read the wrong record while
+    // contiguity assert caught exactly that; this is the fix it asked for.
+    //
+    // So the array stays whole and the KERNEL derives n_pages from the K it is
+    // given. The setter checks coverage rather than equality (it is sized to the
+    // cache, K to the step).
+    const int64_t  n_pages = (n_kv + B - 1) / B;
+
+    GGML_ASSERT(n_pages <= b->ne[1]);
+
+    return b;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1545,6 +1775,7 @@ struct args_set_input_kq_mask {
     const std::vector<uint32_t>       & seq_to_stream;
 
     uint32_t       n_swa;
+    uint32_t       n_sink;
     llama_swa_type swa_type;
 
     int64_t n_kv;
@@ -1561,6 +1792,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const auto & seq_to_stream = args.seq_to_stream;
 
     const uint32_t       n_swa    = args.n_swa;
+    const uint32_t       n_sink   = args.n_sink;
     const llama_swa_type swa_type = args.swa_type;
 
     const int64_t n_kv     = args.n_kv;
@@ -1604,6 +1836,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
             //   ones in the batch (i.e. due to causal masking, SWA, etc.)
+            // note: sink cells (pos < n_sink) are far below that range, but they are never masked
+            //   for any p1 in the batch, so the copied value is already correct for them
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
@@ -1682,7 +1916,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // apply SWA if any
                 if (swa) {
-                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                    if (llama_hparams::is_masked_swa(n_swa, n_sink, swa_type, p0, p1)) {
                         goto skip;
                     }
                 }
@@ -1761,6 +1995,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
         /*.n_swa            =*/ n_swa,
+        /*.n_sink           =*/ n_sink,
         /*.swa_type         =*/ swa_type,
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
@@ -2120,7 +2355,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
+                const bool is_masked = llama_hparams::is_masked_swa(n_swa, n_sink, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
 
                 add_cell = !is_masked;
             }
@@ -2695,6 +2930,32 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    // an EXISTING record (ADR-0024, Consequences: three sites, not eight).
+    //
+    // A checkpoint restore writes raw key rows straight into the cache above,
+    // so nothing the bound builder has ever seen describes them. state_read_meta
+    // reaches the sentinel writer through apply_ubatch for the cells it claims;
+    // this call is what covers the BYTES, including the seq_id == -1 whole-cache
+    // path where no ubatch is applied at all. It runs after the last transfer,
+    // so a restore that fails half way has already returned and left the bounds
+    // untouched -- the caller then clears or seq_rm's, and both of those
+    // invalidate on their own.
+    if (cell_count) {
+        uint32_t row_first   = cells.size();
+        uint32_t row_last_p1 = 0;
+
+        if (sinfo.is_contiguous()) {
+            row_first   = sinfo.head();
+            row_last_p1 = row_first + cell_count;
+        } else {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                row_first   = std::min(row_first,   (uint32_t) sinfo.idxs[0][i]);
+                row_last_p1 = std::max(row_last_p1, (uint32_t) sinfo.idxs[0][i] + 1);
+            }
+        }
+
+    }
+
     return true;
 }
 
@@ -2789,6 +3050,8 @@ ggml_type llama_kv_cache_context::type_v() const {
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+}
+
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

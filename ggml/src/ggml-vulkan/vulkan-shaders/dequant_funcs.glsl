@@ -145,12 +145,39 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 
 #if defined(DATA_A_Q2_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
-    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]) >> (2u * (iqs % 4u));
-    return vec2(bits & 3u, (bits >> 2u) & 3u) - 1.0f;
+    // 2-bit codes {0,1,2,3} map to {-1,0,+1,+2}
+    const uint q = uint(data_a[a_offset + ib].qs[iqs / 4u]) >> ((iqs % 4u) * 2u);
+    return vec2(int(q & 3u) - 1, int((q >> 2u) & 3u) - 1);
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-    const uint bits = uint(data_a[a_offset + ib].qs[iqs / 4u]);
-    return vec4(bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, bits >> 6u) - 1.0f;
+    const uint q = uint(data_a[a_offset + ib].qs[iqs / 4u]);
+    return vec4(int(q & 3u), int((q >> 2u) & 3u), int((q >> 4u) & 3u), int(q >> 6u)) - 1.0f;
+}
+#endif
+
+#if defined(DATA_A_Q2_B3)
+// base-3 decode, v2 chunk-aligned layout: 32-trit chunk c owns bytes [6c..6c+5]
+// (5 trits each) + 2 straggler trits in byte 24+(c>>1) at digit 2*(c&1).
+// Values returned pre-scaled (one scale per block, `d0`), get_dm is 1.
+uint q2b3_byte(uint j)  { const uint c = j >> 5, t = j & 31u; return t < 30u ? 6u*c + t/5u : 24u + (c >> 1u); }
+uint q2b3_digit(uint j) { const uint c = j >> 5, t = j & 31u; return t < 30u ? t % 5u : 2u*(c & 1u) + (t - 30u); }
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+    const float d0 = float(data_a[a_offset + ib].d0);
+    const uint b0 = uint(data_a[a_offset + ib].qs[q2b3_byte(iqs)]);
+    const uint b1 = uint(data_a[a_offset + ib].qs[q2b3_byte(iqs + 1u)]);
+    return vec2(d0 * float(int((b0 / pw3[q2b3_digit(iqs)]) % 3u) - 1),
+                d0 * float(int((b1 / pw3[q2b3_digit(iqs + 1u)]) % 3u) - 1));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint pw3[5] = { 1u, 3u, 9u, 27u, 81u };
+    const float d0 = float(data_a[a_offset + ib].d0);
+    vec4 v;
+    [[unroll]] for (uint t = 0; t < 4; ++t) {
+        const uint j = iqs + t;
+        v[t] = d0 * float(int((uint(data_a[a_offset + ib].qs[q2b3_byte(j)]) / pw3[q2b3_digit(j)]) % 3u) - 1);
+    }
+    return v;
 }
 #endif
 
@@ -558,7 +585,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }
@@ -568,6 +595,18 @@ vec2 get_dm(uint ib, uint a_offset) {
 vec2 get_dm(uint ib, uint a_offset) {
     const float d = float(data_a[a_offset + ib].d);
     return vec2(d, 0);
+}
+#endif
+
+#if defined(DATA_A_Q2_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_Q2_B3)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(1.0, 0.0);
 }
 #endif
 

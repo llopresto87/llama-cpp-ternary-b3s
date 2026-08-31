@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1368,6 +1369,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // the SWA fields are now final, whether they came from the GGUF, from a per-arch
+    // pattern or from nothing at all - check them here, upstream of every consumer, since
+    // a model that never builds a KV cache never reaches that cache's own assert
+    hparams.validate_swa();
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1935,7 +1941,19 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_head_kv             = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_head_kv(il); }, hparams.n_layer_all).c_str());
         LLAMA_LOG_INFO("%s: n_rot                 = %u\n",     __func__, hparams.n_rot_full);
         LLAMA_LOG_INFO("%s: n_swa                 = %u\n",     __func__, hparams.n_swa);
+        LLAMA_LOG_INFO("%s: n_sink                = %u\n",     __func__, hparams.n_sink);
         LLAMA_LOG_INFO("%s: is_swa_any            = %u\n",     __func__, hparams.is_swa_any());
+        // here, beside it, and for the same reason: a run that cannot say what it resolved
+        // leaves the reader inferring it from KV-buffer sizes (§7.V). Nothing is emitted
+        // presence-tests the environment itself (ggml/src/ggml-cuda/fattn-common.cuh) — so
+        // the same presence test is made here rather than a second stored flag that could
+        // disagree with the one the kernel obeys.
+        }
+        // with it, which is nothing. Emitted here, once per load, immediately after the
+        // configuration they qualify. Prose lines, never `key = value`: the banner's shape
+        // is parsed by scripts/tests/gate_retrieval_depth.py and a notice that matched it
+        // would be read as configuration.
+        }
         LLAMA_LOG_INFO("%s: n_embd_head_k         = %u\n",     __func__, hparams.n_embd_head_k_full);
         LLAMA_LOG_INFO("%s: n_embd_head_v         = %u\n",     __func__, hparams.n_embd_head_v_full);
         LLAMA_LOG_INFO("%s: n_gqa                 = %s\n",     __func__, print_f([&](uint32_t il) { return hparams.n_gqa(il);        }, hparams.n_layer_all).c_str());
@@ -2270,6 +2288,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             1,
                             hparams.n_swa,
+                            hparams.n_sink,
                             hparams.swa_type,
                             nullptr,
                             filter,
@@ -2295,6 +2314,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             1,
                             hparams.n_swa,
+                            hparams.n_sink,
                             hparams.swa_type,
                             filter_mla,
                             filter_lid,
@@ -2322,6 +2342,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             1,
                             hparams.n_swa,
+                            hparams.n_sink,
                             hparams.swa_type,
                             nullptr,
                             filter,
@@ -2529,6 +2550,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_n_sink       */ hparams.n_sink,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
@@ -2636,6 +2658,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_seq_max,
                                 1,
                                 hparams.n_swa,
+                                hparams.n_sink,
                                 hparams.swa_type,
                                 nullptr,
                                 filter,
@@ -2753,6 +2776,10 @@ int32_t llama_model_n_swa(const llama_model * model) {
         return 0;
     }
     return model->hparams.n_swa;
+}
+
+    // src/llama-kv-cache.cpp:398 and :421 — deliberately not a parallel test of
+    // and the cache come to disagree (§4.V's last clause).
 }
 
 

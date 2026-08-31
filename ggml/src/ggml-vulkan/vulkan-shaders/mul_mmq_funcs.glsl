@@ -6,40 +6,6 @@
 
 // Each iqs value maps to a 32-bit integer
 
-#if defined(DATA_A_Q2_0)
-void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
-    const uint block_idx = ib / 2;
-    const uint byte_idx = (ib & 1u) * 8u + iqs;
-    const uint bits = uint(data_a[block_idx].qs[byte_idx]);
-    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
-        int8_t(bits & 3u),
-        int8_t((bits >> 2u) & 3u),
-        int8_t((bits >> 4u) & 3u),
-        int8_t(bits >> 6u)));
-
-    if (iqs == 0) {
-        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[block_idx].d);
-    }
-}
-
-void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
-    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
-
-    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
-        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
-    }
-}
-
-ACC_TYPE mmq_dot_product(const uint ib_a) {
-    int32_t q_sum = 0;
-    [[unroll]] for (uint iqs = 0; iqs < 8; ++iqs) {
-        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
-    }
-
-    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
-}
-#endif
-
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
 // 2-byte loads for Q4_0 blocks (18 bytes)
 // 4-byte loads for Q4_1 blocks (20 bytes)
@@ -175,6 +141,91 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
     }
 
     return ACC_TYPE(float(q_sum) * float(cache_a[ib_a].dm) * float(cache_b.ds.x));
+}
+#endif
+
+#if defined(DATA_A_Q2_0)
+// ib counts 32-value chunks; the Q2_0 block covers two of them. Two loader
+// lanes copy its eight compressed bytes to LDS as uint32 words.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_q = ib / 2;
+    const uint src = (ib & 1u) * 4u + iqs * 2u;
+    buf_a[buf_ib].qs[iqs] = pack32(u16vec2(data_a_packed16[ib_q].qs[src],
+                                           data_a_packed16[ib_q].qs[src + 1u]));
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a_packed16[ib_q].d);
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        const uint q = (buf_a[buf_ib].qs[iqs / 4u] >> (8u * (iqs & 3u))) & 0xFFu;
+        // Spread four unsigned 2-bit codes into four int8 lanes.
+        uint32_t v = (q | (q << 12)) & 0x000F000Fu;
+        v = (v | (v << 6)) & 0x03030303u;
+        cache_a[reg_ib].qs[iqs] = int32_t(v);
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    // codes are value+1: subtract the Q8_1 block sum once per 32 values
+    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
+}
+#endif
+
+#if defined(DATA_A_Q2_B3)
+// Base-3 packed ternary. ib counts 32-value chunks; the 128-value block covers
+// four of them. Decode the 4-value word for this iqs directly (amortized: this
+// load path runs once per tile, the dot loop below is plain integer dots).
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint blk = ib / 4;
+    const uint c   = ib & 3u;
+
+    // v2 chunk-aligned layout: chunk c owns bytes [6c..6c+5] plus two
+    // straggler trits in byte 24+(c>>1). The unified window also covers the
+    // straggler lane without control-flow divergence.
+    const uint i0 = 4u * iqs;
+    const uint sA = 2u * (i0 % 5u);
+    const uint bA = 6u * c + i0 / 5u;
+    const uint bB = (iqs == 7u) ? 24u + (c >> 1u) : bA + 1u;
+    const uint sB = (iqs == 7u) ? 4u * (c & 1u) : 0u;
+    const uint LA = uint(b3_lut[uint(data_a[blk].qs[bA])]);
+    const uint LB = uint(b3_lut[uint(data_a[blk].qs[bB])]);
+    const uint crumbs = ((LA >> sA) | ((LB >> sB) << (10u - sA))) & 0xFFu;
+
+    uint32_t packed = (crumbs | (crumbs << 12u)) & 0x000F000Fu;
+    packed = (packed | (packed << 6u)) & 0x03030303u;
+    buf_a[buf_ib].qs[iqs] = int32_t(packed);
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a[blk].d0);
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    // codes are value+1: subtract the Q8_1 block sum once per 32 values
+    return ACC_TYPE(float(cache_a[ib_a].dm) * (float(q_sum) * float(cache_b.ds.x) - float(cache_b.ds.y)));
 }
 #endif
 
