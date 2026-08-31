@@ -129,6 +129,30 @@ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & r
 }
 
 template <typename type4x4>
+void dequantize_q2_b3(device const block_q2_b3 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs;
+    const float d = xb->d;
+
+    // base-3 v2 chunk-aligned (see quantize_row_q2_b3_ref). element j is in
+    // chunk c=j>>5, t=j&31; first 30 trits pack 5/byte in [6c..6c+5], the 2
+    // straggler trits go to byte 24+(c>>1) at digit 2*(c&1). il picks 16.
+    const int pw3[5] = {1, 3, 9, 27, 81};
+    float4x4 reg_f;
+
+    const short base = il * 16;
+    for (int k = 0; k < 16; k++) {
+        const int j = base + k;
+        const int c = j >> 5, t = j & 31;
+        const int byte  = (t < 30) ? (6*c + t/5) : (24 + (c >> 1));
+        const int digit = (t < 30) ? (t % 5)     : (2*(c & 1) + (t - 30));
+        const int q = ((int) qs[byte] / pw3[digit]) % 3;
+        reg_f[k/4][k%4] = ((float) (q - 1)) * d;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
     const float d1 = il ? (xb->d / 16.h) : xb->d;
